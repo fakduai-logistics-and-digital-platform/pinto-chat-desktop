@@ -1,0 +1,36 @@
+{
+  "name": "pinto-chat-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@phosphor-icons/vue": "^2.2.1",
+    "@remixicon/vue": "^4.9.0",
+    "@tauri-apps/api": "^2.6.0",
+    "@tauri-apps/plugin-notification": "^2.2.2",
+    "@tauri-apps/plugin-shell": "^2.2.1",
+    "@tauri-apps/plugin-sql": "^2.2.1",
+    "@types/qrcode": "^1.5.6",
+    "pinia": "^3.0.3",
+    "qrcode": "^1.5.4",
+    "vue": "^3.5.16",
+    "vue-router": "^4.5.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.6.2",
+    "@types/node": "^24.0.4",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vue-tsc": "^2.2.10"
+  }
+}

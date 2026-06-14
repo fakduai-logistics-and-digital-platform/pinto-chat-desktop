@@ -1,0 +1,10 @@
+export const APP_NAME = 'Pinto Chat Desktop'
+export const DB_NAME = 'pinto-chat'
+export const MAX_MESSAGE_LENGTH = 1000
+export const TYPING_DEBOUNCE_MS = 800
+export const TYPING_TIMEOUT_MS = 1500
+export const TYPING_AUTO_CLEAR_MS = 3000
+export const SEARCH_DEBOUNCE_MS = 300
+export const CHAT_PAGE_SIZE = 20
+export const MESSAGE_PAGE_SIZE = 50
+export const WS_RECONNECT_DELAYS = [1000, 2000, 5000, 10000, 30000]

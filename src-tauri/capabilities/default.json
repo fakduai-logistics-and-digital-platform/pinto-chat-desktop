@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nickelpack/tauri-v2-schemas/refs/heads/main/json-schema/2.1.1/capabilities.schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "sql:default",
+    "sql:allow-execute",
+    "sql:allow-select",
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-request-permission",
+    "notification:allow-is-permission-granted",
+    "shell:default"
+  ]
+}

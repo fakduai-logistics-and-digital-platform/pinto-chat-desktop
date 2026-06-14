@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "if": "Write(src/**/*.vue)|Write(src/**/*.css)|Edit(src/**/*.vue)|Edit(src/**/*.css)",
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "You are reviewing a UI file change against Pinto's design system.\n\n1. Read @DESIGN.md to understand the color palette, typography, and design philosophy\n2. Review the UI changes being made against these guidelines\n3. Consider if the design should use /design-taste-frontend-v1 (editorial style), /industrial-brutalist-ui (mechanical), or /brandkit (brand guidelines)\n4. Suggest design improvements that align with the Pinto design system\n\nFocus on: color consistency, typography hierarchy, spacing, and design intent from DESIGN.md",
+            "timeout": 120,
+            "statusMessage": "Reviewing UI against design system..."
+          }
+        ]
+      }
+    ]
+  }
+}
