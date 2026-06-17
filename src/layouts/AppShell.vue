@@ -14,6 +14,7 @@ import ChatList from '@/features/chats/components/ChatList.vue'
 import ChatRoom from '@/features/messages/components/ChatRoom.vue'
 import AppAvatar from '@/shared/components/AppAvatar.vue'
 import { useNotifications } from '@/features/notifications/notification.service'
+import logoUrl from '@/assets/logo.png'
 
 const chatsStore = useChatsStore()
 const messagesStore = useMessagesStore()
@@ -82,10 +83,8 @@ onUnmounted(() => {
 <template>
   <div class="flex h-screen overflow-hidden bg-background text-ink">
     <aside class="flex w-16 shrink-0 flex-col border-r border-divider bg-surface">
-      <div class="flex h-10 items-center gap-1 px-2">
-        <span class="h-3 w-3 rounded-full bg-[#ff5f57]"></span>
-        <span class="h-3 w-3 rounded-full bg-[#ffbd2e]"></span>
-        <span class="h-3 w-3 rounded-full bg-[#28c840]"></span>
+      <div class="flex h-10 items-center justify-center px-2">
+        <img :src="logoUrl" alt="Pinto" class="h-7 w-7 rounded-sm object-contain" />
       </div>
 
       <div class="flex flex-1 flex-col items-center gap-5 py-3">
