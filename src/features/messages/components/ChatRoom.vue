@@ -29,6 +29,34 @@ const isTyping = computed(() => {
   return chatsStore.typingChats.has(chatsStore.selectedChatId)
 })
 
+const messageLookup = computed(() => {
+  const lookup = new Map<string, typeof messages.value[number]>()
+  for (const msg of messages.value) lookup.set(msg.message_id, msg)
+  return lookup
+})
+
+function getSenderName(msg: typeof messages.value[number]) {
+  if (!msg.raw_json) return 'Unknown'
+  try {
+    const raw = JSON.parse(msg.raw_json) as { sender?: { name?: string; display_name?: string; full_name?: string }; sender_name?: string }
+    return raw.sender?.name ?? raw.sender?.display_name ?? raw.sender?.full_name ?? raw.sender_name ?? 'Unknown'
+  } catch {
+    return 'Unknown'
+  }
+}
+
+function getReplyPreview(replyTo: string | null) {
+  if (!replyTo) return null
+  const replied = messageLookup.value.get(replyTo)
+  if (!replied) return null
+  return { sender_name: getSenderName(replied), content: replied.content }
+}
+
+async function handleDeleteMessage(messageId: string) {
+  if (!chatsStore.selectedChatId) return
+  await messagesStore.deleteMessage(chatsStore.selectedChatId, messageId)
+}
+
 const groupedMessages = computed(() => {
   const groups: { date: string; messages: typeof messages.value }[] = []
   let currentDate = ''
@@ -103,15 +131,15 @@ watch(
 </script>
 
 <template>
-  <div v-if="!chatsStore.selectedChatId" class="flex h-full items-center justify-center bg-[#303236]">
-    <div class="flex flex-col items-center text-center text-[#898b90]">
-      <div class="mb-6 flex h-24 w-24 items-center justify-center rounded-full bg-[#4a4b50] text-[#303236]">
+  <div v-if="!chatsStore.selectedChatId" class="flex h-full items-center justify-center bg-background">
+    <div class="flex flex-col items-center text-center text-ink-subtitle">
+      <div class="mb-6 flex h-24 w-24 items-center justify-center rounded-full bg-pinto-50 text-pinto">
         <svg class="h-16 w-16" viewBox="0 0 120 96" fill="currentColor" aria-hidden="true">
           <path d="M60 8c29.8 0 54 17.7 54 39.5 0 15.6-12.3 29.1-30.2 35.5l-18.6 10.2 3.1-7.3c-2.7.3-5.5.5-8.3.5-29.8 0-54-17.7-54-39.5S30.2 8 60 8Z" />
         </svg>
       </div>
-      <div class="text-title-md font-semibold text-[#65676c]">LINE</div>
-      <div class="mt-4 text-body-sm text-[#9a9ca0]">เริ่มการแชทใหม่!</div>
+      <div class="text-title-md font-semibold text-ink">Pinto</div>
+      <div class="mt-4 text-body-sm text-ink-subtitle">เริ่มการแชทใหม่!</div>
     </div>
   </div>
 
@@ -127,7 +155,6 @@ watch(
         <div>
           <div class="flex items-center gap-2 text-title-md text-ink font-semibold">
             <span>{{ chatsStore.selectedChat?.name ?? 'Unknown' }}</span>
-            <span v-if="chatsStore.selectedChat?.chat_type === 'direct'" class="rounded-xs bg-pinto px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">BOT</span>
           </div>
           <div class="text-caption text-ink-subtitle">
             {{ chatsStore.selectedChat?.chat_type === 'group' ? 'กลุ่ม' : 'bot' }}
@@ -164,7 +191,9 @@ watch(
             :key="msg.message_id"
             :message="msg"
             :is-self="msg.sender_id === auth.currentUser?.user_id"
+            :reply-preview="getReplyPreview(msg.reply_to)"
             @reply="handleReply"
+            @delete="handleDeleteMessage"
             @retry="messagesStore.retryMessage(chatsStore.selectedChatId!, msg.message_id)"
           />
         </template>
