@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, computed, onUnmounted } from 'vue'
+import { ref, watch, nextTick, computed, onMounted, onUnmounted } from 'vue'
 import { useChatsStore } from '@/features/chats/chats.store'
 import { useMessagesStore } from '@/features/messages/messages.store'
 import { useAuthStore } from '@/features/auth/auth.store'
@@ -21,8 +21,28 @@ const messageListEl = ref<HTMLDivElement | null>(null)
 const showScrollBtn = ref(false)
 const replyMessage = ref<{ message_id: string; content: string; sender_name: string } | null>(null)
 const pendingDeleteMessageId = ref<string | null>(null)
+const menuOpen = ref(false)
+const headerMenuEl = ref<HTMLElement | null>(null)
 const toastMessage = ref('')
 let toastTimer: ReturnType<typeof setTimeout> | null = null
+
+const headerMenuItems = [
+  { key: 'mute', label: 'Mute chat' },
+  { key: 'invite', label: 'Invite' },
+  { key: 'albums', label: 'Albums' },
+  { key: 'media', label: 'Photos & videos' },
+  { key: 'files', label: 'Files' },
+  { key: 'links', label: 'Links' },
+  { key: 'poll', label: 'Poll' },
+  { key: 'save', label: 'Save chat' },
+  { key: 'background', label: 'Background Settings' },
+  { key: 'protected', label: 'This chat is protected' },
+]
+
+const headerDangerItems = [
+  { key: 'report', label: 'Report' },
+  { key: 'block', label: 'Block' },
+]
 
 const messages = computed(() => {
   if (!chatsStore.selectedChatId) return []
@@ -64,6 +84,24 @@ function showToast(message: string) {
     toastMessage.value = ''
     toastTimer = null
   }, 2200)
+}
+
+function closeHeaderMenu() {
+  menuOpen.value = false
+}
+
+function handleDocumentClick(event: MouseEvent) {
+  if (!menuOpen.value) return
+  if (!headerMenuEl.value?.contains(event.target as Node)) closeHeaderMenu()
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeHeaderMenu()
+}
+
+function handleHeaderMenuSelect(label: string) {
+  showToast(label)
+  closeHeaderMenu()
 }
 
 function handleCopyMessage() {
@@ -160,7 +198,14 @@ watch(
   { immediate: true },
 )
 
+onMounted(() => {
+  document.addEventListener('click', handleDocumentClick)
+  document.addEventListener('keydown', handleKeydown)
+})
+
 onUnmounted(() => {
+  document.removeEventListener('click', handleDocumentClick)
+  document.removeEventListener('keydown', handleKeydown)
   if (toastTimer) clearTimeout(toastTimer)
 })
 </script>
@@ -196,9 +241,45 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
-      <button class="h-10 w-10 rounded-full text-ink-secondary hover:bg-surface-muted hover:text-ink transition-colors" aria-label="ตัวเลือก">
-        <svg class="mx-auto h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
-      </button>
+      <div ref="headerMenuEl" class="relative">
+        <button
+          class="h-10 w-10 rounded-full text-ink-secondary transition-colors hover:bg-surface-muted hover:text-ink"
+          :class="menuOpen && 'bg-surface-muted text-ink'"
+          type="button"
+          aria-label="ตัวเลือก"
+          @click.stop="menuOpen = !menuOpen"
+        >
+          <svg class="mx-auto h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
+        </button>
+
+        <Transition name="menu-pop">
+          <div
+            v-if="menuOpen"
+            class="absolute right-0 top-12 z-30 w-56 overflow-hidden rounded-xl border border-divider bg-surface py-1 text-left shadow-card"
+            @click.stop
+          >
+            <button
+              v-for="item in headerMenuItems"
+              :key="item.key"
+              class="flex w-full items-center px-4 py-2.5 text-body-sm text-ink hover:bg-surface-muted"
+              type="button"
+              @click="handleHeaderMenuSelect(item.label)"
+            >
+              {{ item.label }}
+            </button>
+            <div class="my-1 border-t border-divider" />
+            <button
+              v-for="item in headerDangerItems"
+              :key="item.key"
+              class="flex w-full items-center px-4 py-2.5 text-body-sm text-error-strong hover:bg-error-container"
+              type="button"
+              @click="handleHeaderMenuSelect(item.label)"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+        </Transition>
+      </div>
     </div>
 
     <!-- Messages -->
@@ -291,6 +372,17 @@ onUnmounted(() => {
 <style scoped>
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+.menu-pop-enter-active,
+.menu-pop-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.menu-pop-enter-from,
+.menu-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
 
 .toast-enter-active,
 .toast-leave-active {
