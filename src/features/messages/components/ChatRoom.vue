@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, computed } from 'vue'
+import { ref, watch, nextTick, computed, onUnmounted } from 'vue'
 import { useChatsStore } from '@/features/chats/chats.store'
 import { useMessagesStore } from '@/features/messages/messages.store'
 import { useAuthStore } from '@/features/auth/auth.store'
 import AppAvatar from '@/shared/components/AppAvatar.vue'
 import AppSkeleton from '@/shared/components/AppSkeleton.vue'
+import AppDialog from '@/shared/components/AppDialog.vue'
+import AppButton from '@/shared/components/AppButton.vue'
 import MessageBubble from './MessageBubble.vue'
 import MessageComposer from './MessageComposer.vue'
 import DateDivider from './DateDivider.vue'
@@ -18,6 +20,9 @@ const auth = useAuthStore()
 const messageListEl = ref<HTMLDivElement | null>(null)
 const showScrollBtn = ref(false)
 const replyMessage = ref<{ message_id: string; content: string; sender_name: string } | null>(null)
+const pendingDeleteMessageId = ref<string | null>(null)
+const toastMessage = ref('')
+let toastTimer: ReturnType<typeof setTimeout> | null = null
 
 const messages = computed(() => {
   if (!chatsStore.selectedChatId) return []
@@ -52,9 +57,35 @@ function getReplyPreview(replyTo: string | null) {
   return { sender_name: getSenderName(replied), content: replied.content }
 }
 
-async function handleDeleteMessage(messageId: string) {
-  if (!chatsStore.selectedChatId) return
-  await messagesStore.deleteMessage(chatsStore.selectedChatId, messageId)
+function showToast(message: string) {
+  toastMessage.value = message
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => {
+    toastMessage.value = ''
+    toastTimer = null
+  }, 2200)
+}
+
+function handleCopyMessage() {
+  showToast('คัดลอกแล้ว')
+}
+
+function handleDeleteMessage(messageId: string) {
+  pendingDeleteMessageId.value = messageId
+}
+
+async function confirmDeleteMessage() {
+  if (!chatsStore.selectedChatId || !pendingDeleteMessageId.value) return
+  await messagesStore.deleteMessage(chatsStore.selectedChatId, pendingDeleteMessageId.value)
+  pendingDeleteMessageId.value = null
+  showToast('ลบข้อความแล้ว')
+}
+
+function isCompactMessage(groupMessages: typeof messages.value, index: number) {
+  if (index === 0) return false
+  const current = groupMessages[index]
+  const previous = groupMessages[index - 1]
+  return current.sender_id === previous.sender_id
 }
 
 const groupedMessages = computed(() => {
@@ -128,6 +159,10 @@ watch(
   },
   { immediate: true },
 )
+
+onUnmounted(() => {
+  if (toastTimer) clearTimeout(toastTimer)
+})
 </script>
 
 <template>
@@ -157,7 +192,7 @@ watch(
             <span>{{ chatsStore.selectedChat?.name ?? 'Unknown' }}</span>
           </div>
           <div class="text-caption text-ink-subtitle">
-            {{ chatsStore.selectedChat?.chat_type === 'group' ? 'กลุ่ม' : 'bot' }}
+            {{ chatsStore.selectedChat?.chat_type === 'group' ? 'กลุ่ม' : 'แชทส่วนตัว' }}
           </div>
         </div>
       </div>
@@ -187,12 +222,15 @@ watch(
         <template v-for="(group, gi) in groupedMessages" :key="gi">
           <DateDivider :date="formatDateDivider(group.date)" />
           <MessageBubble
-            v-for="msg in group.messages"
+            v-for="(msg, mi) in group.messages"
             :key="msg.message_id"
             :message="msg"
             :is-self="msg.sender_id === auth.currentUser?.user_id"
+            :compact="isCompactMessage(group.messages, mi)"
+            :show-sender="!isCompactMessage(group.messages, mi)"
             :reply-preview="getReplyPreview(msg.reply_to)"
             @reply="handleReply"
+            @copied="handleCopyMessage"
             @delete="handleDeleteMessage"
             @retry="messagesStore.retryMessage(chatsStore.selectedChatId!, msg.message_id)"
           />
@@ -225,12 +263,45 @@ watch(
       @sent="scrollToBottom()"
       @cancel-reply="clearReply"
     />
+
+    <Transition name="toast">
+      <div
+        v-if="toastMessage"
+        class="absolute bottom-24 left-1/2 z-30 -translate-x-1/2 rounded-capsule bg-ink px-4 py-2 text-label-sm text-white shadow-toast"
+      >
+        {{ toastMessage }}
+      </div>
+    </Transition>
+
+    <AppDialog
+      :open="pendingDeleteMessageId !== null"
+      title="ลบข้อความ?"
+      max-width="max-w-sm"
+      @close="pendingDeleteMessageId = null"
+    >
+      <p class="text-body-sm text-ink-secondary">ข้อความนี้จะถูกลบจากเครื่องนี้ก่อน ยังไม่ได้ลบจากเซิร์ฟเวอร์</p>
+      <div class="mt-6 flex justify-end gap-2">
+        <AppButton variant="ghost" label="ยกเลิก" @click="pendingDeleteMessageId = null" />
+        <AppButton variant="danger" label="ลบ" @click="confirmDeleteMessage" />
+      </div>
+    </AppDialog>
   </div>
 </template>
 
 <style scoped>
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 6px) scale(0.98);
+}
 
 .chat-panel::before {
   position: absolute;
