@@ -34,6 +34,18 @@ PINTO_PREVIEW=room-dark cargo run   # same, dark theme
 PINTO_PREVIEW=settings cargo run    # settings page
 ```
 
+## Install a built copy
+
+GitHub Actions builds every push to `main` (files under the run's Artifacts) and every `v*` tag (files on the Release page).
+
+**macOS:** the app is not signed with an Apple Developer ID, so macOS blocks it the first time ("damaged" or "unidentified developer"). Unzip it, move `Pinto Chat.app` to Applications, then clear the quarantine flag once:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Pinto Chat.app"
+```
+
+**Windows:** unzip and run `Pinto Chat.exe`. SmartScreen may warn about an unknown publisher; choose More info, then Run anyway.
+
 ## Layout
 
 ```
