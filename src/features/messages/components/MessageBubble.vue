@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { Message } from '../messages.types'
 import { formatMessageTime } from '@/shared/utils/date'
 import AppAvatar from '@/shared/components/AppAvatar.vue'
@@ -7,12 +7,20 @@ import AppAvatar from '@/shared/components/AppAvatar.vue'
 const props = defineProps<{
   message: Message
   isSelf: boolean
+  compact?: boolean
+  showSender?: boolean
+  replyPreview?: { sender_name: string; content: string | null } | null
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   reply: [msg: { message_id: string; content: string; sender_name: string }]
   retry: []
+  delete: [messageId: string]
+  copied: []
 }>()
+
+const menuOpen = ref(false)
+const rootEl = ref<HTMLElement | null>(null)
 
 type RawSender = {
   name?: string
@@ -44,32 +52,120 @@ const sender = computed<RawSender>(() => {
 
 const senderName = computed(() => sender.value.name ?? 'Unknown')
 const senderAvatarUrl = computed(() => sender.value.avatar_url ?? null)
+const messageText = computed(() => props.message.content ?? '')
+const shouldShowSender = computed(() => !props.isSelf && props.showSender !== false)
+
+function closeMenu() {
+  menuOpen.value = false
+}
+
+function handleDocumentClick(event: MouseEvent) {
+  if (!menuOpen.value) return
+  if (!rootEl.value?.contains(event.target as Node)) closeMenu()
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeMenu()
+}
+
+function handleReply() {
+  emit('reply', {
+    message_id: props.message.message_id,
+    content: messageText.value,
+    sender_name: senderName.value,
+  })
+  closeMenu()
+}
+
+async function handleCopy() {
+  if (!messageText.value) return
+  await navigator.clipboard.writeText(messageText.value)
+  emit('copied')
+  closeMenu()
+}
+
+function handleDelete() {
+  emit('delete', props.message.message_id)
+  closeMenu()
+}
+
+onMounted(() => {
+  document.addEventListener('click', handleDocumentClick)
+  document.addEventListener('keydown', handleKeydown)
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('click', handleDocumentClick)
+  document.removeEventListener('keydown', handleKeydown)
+})
 </script>
 
 <template>
-  <div :class="['mb-4 flex', isSelf ? 'justify-end' : 'justify-start']">
+  <div
+    ref="rootEl"
+    :class="['flex', compact ? 'mb-1' : 'mb-4', isSelf ? 'justify-end' : 'justify-start']"
+    @contextmenu.prevent="menuOpen = true"
+  >
     <AppAvatar
-      v-if="!isSelf"
+      v-if="!isSelf && shouldShowSender"
       class="mr-2 mt-1"
       :name="senderName"
       :src="senderAvatarUrl"
       size="sm"
     />
+    <div v-else-if="!isSelf" class="mr-2 w-8 shrink-0" />
+
     <div :class="['group relative max-w-[66%]', isSelf ? 'text-right' : 'text-left']">
+      <button
+        class="absolute top-1 z-20 hidden h-7 w-7 items-center justify-center rounded-full border border-divider bg-surface text-ink-secondary shadow-card transition-colors hover:text-pinto group-hover:flex"
+        :class="isSelf ? '-left-9' : '-right-9'"
+        type="button"
+        aria-label="เมนูข้อความ"
+        @click.stop="menuOpen = !menuOpen"
+      >
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+      </button>
+
+      <Transition name="menu-pop">
+        <div
+          v-if="menuOpen"
+          class="absolute top-9 z-30 w-40 overflow-hidden rounded-xl border border-divider bg-surface py-1 text-left shadow-card"
+          :class="isSelf ? 'right-0' : 'left-0'"
+          @click.stop
+        >
+          <button class="flex w-full px-3 py-2 text-body-sm text-ink hover:bg-surface-muted" type="button" @click="handleReply">ตอบกลับ</button>
+          <button
+            class="flex w-full px-3 py-2 text-body-sm hover:bg-surface-muted"
+            :class="messageText ? 'text-ink' : 'text-ink-disabled'"
+            type="button"
+            :disabled="!messageText"
+            @click="handleCopy"
+          >
+            คัดลอก
+          </button>
+          <button class="flex w-full px-3 py-2 text-body-sm text-ink-disabled" type="button" disabled>ส่งต่อ</button>
+          <button class="flex w-full px-3 py-2 text-body-sm text-ink-disabled" type="button" disabled>ปักหมุด</button>
+          <button class="flex w-full px-3 py-2 text-body-sm text-error-strong hover:bg-error-container" type="button" @click="handleDelete">ลบ</button>
+        </div>
+      </Transition>
+
       <div
         :class="[
           'px-4 py-3 text-body-sm leading-relaxed break-words shadow-[0_10px_30px_rgba(67,61,77,0.08)]',
           isSelf
             ? 'rounded-2xl rounded-br-md bg-[#2ECC71] text-white'
             : 'rounded-2xl rounded-bl-md bg-white text-ink',
+          compact && isSelf ? 'rounded-tr-md' : '',
+          compact && !isSelf ? 'rounded-tl-md' : '',
         ]"
       >
-        <div v-if="!isSelf" class="mb-1 text-caption font-semibold text-[#2ECC71]">
+        <div v-if="shouldShowSender" class="mb-1 text-caption font-semibold text-[#2ECC71]">
           {{ senderName }}
         </div>
 
-        <div v-if="message.reply_to" :class="['mb-1 pl-2 border-l-2 text-caption', isSelf ? 'border-white/40 opacity-75' : 'border-pinto/40 text-ink-secondary']">
-          กำลังตอบข้อความ...
+        <div v-if="message.reply_to" :class="['mb-2 border-l-2 pl-2 text-caption', isSelf ? 'border-white/40 text-white/80' : 'border-pinto/40 text-ink-secondary']">
+          <div class="font-semibold">{{ replyPreview?.sender_name ?? 'ข้อความที่ตอบกลับ' }}</div>
+          <div class="truncate">{{ replyPreview?.content ?? 'กำลังตอบข้อความ...' }}</div>
         </div>
 
         <div v-if="message.message_type === 'image' && message.media_url" class="mb-1">
@@ -108,3 +204,16 @@ const senderAvatarUrl = computed(() => sender.value.avatar_url ?? null)
     </div>
   </div>
 </template>
+
+<style scoped>
+.menu-pop-enter-active,
+.menu-pop-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.menu-pop-enter-from,
+.menu-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+</style>

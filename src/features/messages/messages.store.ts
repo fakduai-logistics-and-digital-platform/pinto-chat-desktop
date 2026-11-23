@@ -182,6 +182,12 @@ export const useMessagesStore = defineStore('messages', () => {
     await sendText(chatId, msg.content, msg.reply_to ?? undefined)
   }
 
+  async function deleteMessage(chatId: string, messageId: string) {
+    await messagesRepo.markDeleted(messageId)
+    const current = messagesByChat.value.get(chatId) ?? []
+    messagesByChat.value.set(chatId, current.filter(m => m.message_id !== messageId))
+  }
+
   return {
     messagesByChat,
     isLoadingMessages,
@@ -196,5 +202,6 @@ export const useMessagesStore = defineStore('messages', () => {
     addMessageFromWs,
     markChatAsRead,
     retryMessage,
+    deleteMessage,
   }
 })

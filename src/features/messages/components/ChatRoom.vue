@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, computed } from 'vue'
+import { ref, watch, nextTick, computed, onMounted, onUnmounted } from 'vue'
 import { useChatsStore } from '@/features/chats/chats.store'
 import { useMessagesStore } from '@/features/messages/messages.store'
 import { useAuthStore } from '@/features/auth/auth.store'
 import AppAvatar from '@/shared/components/AppAvatar.vue'
 import AppSkeleton from '@/shared/components/AppSkeleton.vue'
+import AppDialog from '@/shared/components/AppDialog.vue'
+import AppButton from '@/shared/components/AppButton.vue'
 import MessageBubble from './MessageBubble.vue'
 import MessageComposer from './MessageComposer.vue'
 import DateDivider from './DateDivider.vue'
@@ -18,6 +20,29 @@ const auth = useAuthStore()
 const messageListEl = ref<HTMLDivElement | null>(null)
 const showScrollBtn = ref(false)
 const replyMessage = ref<{ message_id: string; content: string; sender_name: string } | null>(null)
+const pendingDeleteMessageId = ref<string | null>(null)
+const menuOpen = ref(false)
+const headerMenuEl = ref<HTMLElement | null>(null)
+const toastMessage = ref('')
+let toastTimer: ReturnType<typeof setTimeout> | null = null
+
+const headerMenuItems = [
+  { key: 'mute', label: 'Mute chat' },
+  { key: 'invite', label: 'Invite' },
+  { key: 'albums', label: 'Albums' },
+  { key: 'media', label: 'Photos & videos' },
+  { key: 'files', label: 'Files' },
+  { key: 'links', label: 'Links' },
+  { key: 'poll', label: 'Poll' },
+  { key: 'save', label: 'Save chat' },
+  { key: 'background', label: 'Background Settings' },
+  { key: 'protected', label: 'This chat is protected' },
+]
+
+const headerDangerItems = [
+  { key: 'report', label: 'Report' },
+  { key: 'block', label: 'Block' },
+]
 
 const messages = computed(() => {
   if (!chatsStore.selectedChatId) return []
@@ -28,6 +53,78 @@ const isTyping = computed(() => {
   if (!chatsStore.selectedChatId) return false
   return chatsStore.typingChats.has(chatsStore.selectedChatId)
 })
+
+const messageLookup = computed(() => {
+  const lookup = new Map<string, typeof messages.value[number]>()
+  for (const msg of messages.value) lookup.set(msg.message_id, msg)
+  return lookup
+})
+
+function getSenderName(msg: typeof messages.value[number]) {
+  if (!msg.raw_json) return 'Unknown'
+  try {
+    const raw = JSON.parse(msg.raw_json) as { sender?: { name?: string; display_name?: string; full_name?: string }; sender_name?: string }
+    return raw.sender?.name ?? raw.sender?.display_name ?? raw.sender?.full_name ?? raw.sender_name ?? 'Unknown'
+  } catch {
+    return 'Unknown'
+  }
+}
+
+function getReplyPreview(replyTo: string | null) {
+  if (!replyTo) return null
+  const replied = messageLookup.value.get(replyTo)
+  if (!replied) return null
+  return { sender_name: getSenderName(replied), content: replied.content }
+}
+
+function showToast(message: string) {
+  toastMessage.value = message
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => {
+    toastMessage.value = ''
+    toastTimer = null
+  }, 2200)
+}
+
+function closeHeaderMenu() {
+  menuOpen.value = false
+}
+
+function handleDocumentClick(event: MouseEvent) {
+  if (!menuOpen.value) return
+  if (!headerMenuEl.value?.contains(event.target as Node)) closeHeaderMenu()
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') closeHeaderMenu()
+}
+
+function handleHeaderMenuSelect(label: string) {
+  showToast(label)
+  closeHeaderMenu()
+}
+
+function handleCopyMessage() {
+  showToast('คัดลอกแล้ว')
+}
+
+function handleDeleteMessage(messageId: string) {
+  pendingDeleteMessageId.value = messageId
+}
+
+async function confirmDeleteMessage() {
+  if (!chatsStore.selectedChatId || !pendingDeleteMessageId.value) return
+  await messagesStore.deleteMessage(chatsStore.selectedChatId, pendingDeleteMessageId.value)
+  pendingDeleteMessageId.value = null
+  showToast('ลบข้อความแล้ว')
+}
+
+function isCompactMessage(groupMessages: typeof messages.value, index: number) {
+  if (index === 0) return false
+  const current = groupMessages[index]
+  const previous = groupMessages[index - 1]
+  return current.sender_id === previous.sender_id
+}
 
 const groupedMessages = computed(() => {
   const groups: { date: string; messages: typeof messages.value }[] = []
@@ -100,18 +197,29 @@ watch(
   },
   { immediate: true },
 )
+
+onMounted(() => {
+  document.addEventListener('click', handleDocumentClick)
+  document.addEventListener('keydown', handleKeydown)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('click', handleDocumentClick)
+  document.removeEventListener('keydown', handleKeydown)
+  if (toastTimer) clearTimeout(toastTimer)
+})
 </script>
 
 <template>
-  <div v-if="!chatsStore.selectedChatId" class="flex h-full items-center justify-center bg-[#303236]">
-    <div class="flex flex-col items-center text-center text-[#898b90]">
-      <div class="mb-6 flex h-24 w-24 items-center justify-center rounded-full bg-[#4a4b50] text-[#303236]">
+  <div v-if="!chatsStore.selectedChatId" class="flex h-full items-center justify-center bg-background">
+    <div class="flex flex-col items-center text-center text-ink-subtitle">
+      <div class="mb-6 flex h-24 w-24 items-center justify-center rounded-full bg-pinto-50 text-pinto">
         <svg class="h-16 w-16" viewBox="0 0 120 96" fill="currentColor" aria-hidden="true">
           <path d="M60 8c29.8 0 54 17.7 54 39.5 0 15.6-12.3 29.1-30.2 35.5l-18.6 10.2 3.1-7.3c-2.7.3-5.5.5-8.3.5-29.8 0-54-17.7-54-39.5S30.2 8 60 8Z" />
         </svg>
       </div>
-      <div class="text-title-md font-semibold text-[#65676c]">LINE</div>
-      <div class="mt-4 text-body-sm text-[#9a9ca0]">เริ่มการแชทใหม่!</div>
+      <div class="text-title-md font-semibold text-ink">Pinto</div>
+      <div class="mt-4 text-body-sm text-ink-subtitle">เริ่มการแชทใหม่!</div>
     </div>
   </div>
 
@@ -127,16 +235,51 @@ watch(
         <div>
           <div class="flex items-center gap-2 text-title-md text-ink font-semibold">
             <span>{{ chatsStore.selectedChat?.name ?? 'Unknown' }}</span>
-            <span v-if="chatsStore.selectedChat?.chat_type === 'direct'" class="rounded-xs bg-pinto px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">BOT</span>
           </div>
           <div class="text-caption text-ink-subtitle">
-            {{ chatsStore.selectedChat?.chat_type === 'group' ? 'กลุ่ม' : 'bot' }}
+            {{ chatsStore.selectedChat?.chat_type === 'group' ? 'กลุ่ม' : 'แชทส่วนตัว' }}
           </div>
         </div>
       </div>
-      <button class="h-10 w-10 rounded-full text-ink-secondary hover:bg-surface-muted hover:text-ink transition-colors" aria-label="ตัวเลือก">
-        <svg class="mx-auto h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
-      </button>
+      <div ref="headerMenuEl" class="relative">
+        <button
+          class="h-10 w-10 rounded-full text-ink-secondary transition-colors hover:bg-surface-muted hover:text-ink"
+          :class="menuOpen && 'bg-surface-muted text-ink'"
+          type="button"
+          aria-label="ตัวเลือก"
+          @click.stop="menuOpen = !menuOpen"
+        >
+          <svg class="mx-auto h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg>
+        </button>
+
+        <Transition name="menu-pop">
+          <div
+            v-if="menuOpen"
+            class="absolute right-0 top-12 z-30 w-56 overflow-hidden rounded-xl border border-divider bg-surface py-1 text-left shadow-card"
+            @click.stop
+          >
+            <button
+              v-for="item in headerMenuItems"
+              :key="item.key"
+              class="flex w-full items-center px-4 py-2.5 text-body-sm text-ink hover:bg-surface-muted"
+              type="button"
+              @click="handleHeaderMenuSelect(item.label)"
+            >
+              {{ item.label }}
+            </button>
+            <div class="my-1 border-t border-divider" />
+            <button
+              v-for="item in headerDangerItems"
+              :key="item.key"
+              class="flex w-full items-center px-4 py-2.5 text-body-sm text-error-strong hover:bg-error-container"
+              type="button"
+              @click="handleHeaderMenuSelect(item.label)"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+        </Transition>
+      </div>
     </div>
 
     <!-- Messages -->
@@ -160,11 +303,16 @@ watch(
         <template v-for="(group, gi) in groupedMessages" :key="gi">
           <DateDivider :date="formatDateDivider(group.date)" />
           <MessageBubble
-            v-for="msg in group.messages"
+            v-for="(msg, mi) in group.messages"
             :key="msg.message_id"
             :message="msg"
             :is-self="msg.sender_id === auth.currentUser?.user_id"
+            :compact="isCompactMessage(group.messages, mi)"
+            :show-sender="!isCompactMessage(group.messages, mi)"
+            :reply-preview="getReplyPreview(msg.reply_to)"
             @reply="handleReply"
+            @copied="handleCopyMessage"
+            @delete="handleDeleteMessage"
             @retry="messagesStore.retryMessage(chatsStore.selectedChatId!, msg.message_id)"
           />
         </template>
@@ -196,12 +344,56 @@ watch(
       @sent="scrollToBottom()"
       @cancel-reply="clearReply"
     />
+
+    <Transition name="toast">
+      <div
+        v-if="toastMessage"
+        class="absolute bottom-24 left-1/2 z-30 -translate-x-1/2 rounded-capsule bg-ink px-4 py-2 text-label-sm text-white shadow-toast"
+      >
+        {{ toastMessage }}
+      </div>
+    </Transition>
+
+    <AppDialog
+      :open="pendingDeleteMessageId !== null"
+      title="ลบข้อความ?"
+      max-width="max-w-sm"
+      @close="pendingDeleteMessageId = null"
+    >
+      <p class="text-body-sm text-ink-secondary">ข้อความนี้จะถูกลบจากเครื่องนี้ก่อน ยังไม่ได้ลบจากเซิร์ฟเวอร์</p>
+      <div class="mt-6 flex justify-end gap-2">
+        <AppButton variant="ghost" label="ยกเลิก" @click="pendingDeleteMessageId = null" />
+        <AppButton variant="danger" label="ลบ" @click="confirmDeleteMessage" />
+      </div>
+    </AppDialog>
   </div>
 </template>
 
 <style scoped>
 .fade-enter-active, .fade-leave-active { transition: opacity 0.15s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+
+.menu-pop-enter-active,
+.menu-pop-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.menu-pop-enter-from,
+.menu-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 6px) scale(0.98);
+}
 
 .chat-panel::before {
   position: absolute;

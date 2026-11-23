@@ -14,6 +14,7 @@ import ChatList from '@/features/chats/components/ChatList.vue'
 import ChatRoom from '@/features/messages/components/ChatRoom.vue'
 import AppAvatar from '@/shared/components/AppAvatar.vue'
 import { useNotifications } from '@/features/notifications/notification.service'
+import logoUrl from '@/assets/logo.png'
 
 const chatsStore = useChatsStore()
 const messagesStore = useMessagesStore()
@@ -80,17 +81,15 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex h-screen overflow-hidden bg-[#2f3033] text-[#d7d7d7]">
-    <aside class="flex w-16 shrink-0 flex-col border-r border-[#424348] bg-[#242527]">
-      <div class="flex h-10 items-center gap-1 px-2">
-        <span class="h-3 w-3 rounded-full bg-[#ff5f57]"></span>
-        <span class="h-3 w-3 rounded-full bg-[#ffbd2e]"></span>
-        <span class="h-3 w-3 rounded-full bg-[#28c840]"></span>
+  <div class="flex h-screen overflow-hidden bg-background text-ink">
+    <aside class="flex w-16 shrink-0 flex-col border-r border-divider bg-surface">
+      <div class="flex h-10 items-center justify-center px-2">
+        <img :src="logoUrl" alt="Pinto" class="h-7 w-7 rounded-sm object-contain" />
       </div>
 
       <div class="flex flex-1 flex-col items-center gap-5 py-3">
         <button
-          class="relative flex h-10 w-10 items-center justify-center rounded-xl text-[#9b9da1] transition-colors hover:bg-[#303236] hover:text-white"
+          class="relative flex h-10 w-10 items-center justify-center rounded-xl text-ink-secondary transition-colors hover:bg-pinto-50 hover:text-pinto"
           aria-label="เปิดเมนู"
           type="button"
           @click="showUserMenu = !showUserMenu"
@@ -98,23 +97,23 @@ onUnmounted(() => {
           <PhList class="h-6 w-6" weight="bold" />
         </button>
 
-        <button class="relative flex h-10 w-10 items-center justify-center rounded-xl bg-[#303236] text-white" type="button" aria-label="แชท">
+        <button class="relative flex h-10 w-10 items-center justify-center rounded-xl bg-pinto-50 text-pinto" type="button" aria-label="แชท" @click="router.push('/chat')">
           <PhRobot class="h-6 w-6" weight="bold" />
           <span v-if="chatsStore.totalUnread > 0" class="absolute right-0 top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-[#ff5a6a] px-1 text-[10px] font-bold leading-none text-white">
             {{ chatsStore.totalUnread > 99 ? '99+' : chatsStore.totalUnread }}
           </span>
         </button>
 
-        <button class="flex h-10 w-10 items-center justify-center rounded-xl text-[#8d8f93] transition-colors hover:bg-[#303236] hover:text-white" type="button" aria-label="เพื่อน">
+        <button class="flex h-10 w-10 items-center justify-center rounded-xl text-ink-secondary transition-colors hover:bg-pinto-50 hover:text-pinto" type="button" aria-label="เพื่อน">
           <svg class="h-6 w-6" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-8 9a8 8 0 0 1 16 0H4Z"/></svg>
         </button>
 
-        <button class="flex h-10 w-10 items-center justify-center rounded-xl text-[#8d8f93] transition-colors hover:bg-[#303236] hover:text-white" type="button" aria-label="เพิ่มเพื่อน">
+        <button class="flex h-10 w-10 items-center justify-center rounded-xl text-ink-secondary transition-colors hover:bg-pinto-50 hover:text-pinto" type="button" aria-label="เพิ่มเพื่อน">
           <svg class="h-6 w-6" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M15 12a5 5 0 1 0-10 0 5 5 0 0 0 10 0Zm-12 9a7 7 0 0 1 14 0H3Zm15-11V7h-3V5h3V2h2v3h3v2h-3v3h-2Z"/></svg>
         </button>
 
         <div class="mt-auto flex flex-col items-center gap-4">
-          <button class="flex h-10 w-10 items-center justify-center rounded-xl text-[#8d8f93] transition-colors hover:bg-[#303236] hover:text-white" type="button" aria-label="ตั้งค่า">
+          <button class="flex h-10 w-10 items-center justify-center rounded-xl text-ink-secondary transition-colors hover:bg-pinto-50 hover:text-pinto" type="button" aria-label="ตั้งค่า" @click="router.push('/settings')">
             <svg class="h-6 w-6" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M7 12h10M10 17h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           </button>
         </div>
@@ -123,17 +122,17 @@ onUnmounted(() => {
       <Transition name="menu-pop">
         <div
           v-if="showUserMenu"
-          class="absolute left-14 top-12 z-30 w-[220px] overflow-hidden rounded-2xl border border-[#4b4c50] bg-[#303236]/95 p-2 shadow-[0_18px_48px_rgba(0,0,0,0.28)] backdrop-blur-xl"
+          class="absolute left-14 top-12 z-30 w-[220px] overflow-hidden rounded-2xl border border-divider bg-surface p-2 shadow-card"
         >
-          <div class="flex items-center gap-3 rounded-xl bg-[#3a3b3f] px-3 py-3">
+          <div class="flex items-center gap-3 rounded-xl bg-pinto-50 px-3 py-3">
             <AppAvatar :name="auth.currentUser?.name ?? auth.currentUser?.username ?? 'User'" :src="auth.currentUser?.profile_image" size="sm" />
             <div class="min-w-0">
-              <div class="truncate text-body-sm font-semibold text-white">{{ auth.currentUser?.name ?? auth.currentUser?.username ?? 'User' }}</div>
-              <div class="truncate text-caption text-[#a2a4a8]">บัญชี Pinto</div>
+              <div class="truncate text-body-sm font-semibold text-ink">{{ auth.currentUser?.name ?? auth.currentUser?.username ?? 'User' }}</div>
+              <div class="truncate text-caption text-ink-subtitle">บัญชี Pinto</div>
             </div>
           </div>
           <button
-            class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-body-sm font-semibold text-[#ededed] transition-all hover:bg-[#3a3b3f] active:scale-[0.99]"
+            class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-body-sm font-semibold text-ink transition-all hover:bg-surface-muted active:scale-[0.99]"
             type="button"
             @click="handleLogout"
           >
@@ -144,28 +143,28 @@ onUnmounted(() => {
       </Transition>
     </aside>
 
-    <aside class="flex w-[300px] shrink-0 flex-col border-r border-[#47484c] bg-[#303236]">
-      <div class="shrink-0 border-b border-[#47484c] px-3 pt-4">
+    <aside class="flex w-[300px] shrink-0 flex-col border-r border-divider bg-surface">
+      <div class="shrink-0 border-b border-divider px-3 pt-4">
         <div class="mb-4 flex items-center justify-between gap-3 text-[13px] font-semibold">
-          <button class="border-b-2 border-white pb-3 text-white" type="button">ทั้งหมด</button>
-          <button class="pb-3 text-[#94969a] hover:text-white" type="button">เพื่อน</button>
-          <button class="pb-3 text-[#94969a] hover:text-white" type="button">กลุ่ม</button>
-          <button class="pb-3 text-[#94969a] hover:text-white" type="button">โอเพนแชท</button>
-          <button class="pb-3 text-[#94969a] hover:text-white" type="button" aria-label="ตัวกรอง">
+          <button :class="['border-b-2 pb-3', chatsStore.filterType === null ? 'border-pinto text-pinto' : 'border-transparent text-ink-secondary hover:text-pinto']" type="button" @click="chatsStore.setFilter(null)">ทั้งหมด</button>
+          <button :class="['border-b-2 pb-3', chatsStore.filterType === 'direct' ? 'border-pinto text-pinto' : 'border-transparent text-ink-secondary hover:text-pinto']" type="button" @click="chatsStore.setFilter('direct')">เพื่อน</button>
+          <button :class="['border-b-2 pb-3', chatsStore.filterType === 'group' ? 'border-pinto text-pinto' : 'border-transparent text-ink-secondary hover:text-pinto']" type="button" @click="chatsStore.setFilter('group')">กลุ่ม</button>
+          <button class="pb-3 text-ink-disabled" type="button" disabled title="ยังไม่รองรับโอเพนแชท">โอเพนแชท</button>
+          <button class="pb-3 text-ink-secondary hover:text-pinto" type="button" aria-label="ตัวกรอง">
             <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M8 5v4M16 15v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           </button>
         </div>
         <div class="mb-3 flex items-center gap-2">
           <div class="relative flex-1">
-            <PhMagnifyingGlass class="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9a9ca0]" weight="bold" />
+            <PhMagnifyingGlass class="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-subtitle" weight="bold" />
             <input
-              class="h-9 w-full rounded bg-[#55565a] pl-9 pr-3 text-body-sm text-white placeholder-[#b8b9bc] outline-none focus:ring-1 focus:ring-[#77797d]"
+              class="h-9 w-full rounded bg-surface-muted pl-9 pr-3 text-body-sm text-ink placeholder-ink-subtitle outline-none ring-1 ring-input-border focus:ring-pinto"
               placeholder="ค้นหาข้อความและห้องแชท"
               :value="chatsStore.searchQuery"
               @input="handleSearchInput"
             />
           </div>
-          <button class="flex h-9 w-9 items-center justify-center rounded text-[#c8c9cc] hover:bg-[#3b3c40]" type="button" aria-label="เรียงลำดับ">
+          <button class="flex h-9 w-9 items-center justify-center rounded text-ink-secondary hover:bg-pinto-50 hover:text-pinto" type="button" aria-label="เรียงลำดับ">
             <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 5v14m0 0-3-3m3 3 3-3M16 19V5m0 0-3 3m3-3 3 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
@@ -173,7 +172,7 @@ onUnmounted(() => {
       <ChatList />
     </aside>
 
-    <main class="min-w-0 flex-1 bg-[#303236]">
+    <main class="min-w-0 flex-1 bg-background">
       <ChatRoom />
     </main>
   </div>
