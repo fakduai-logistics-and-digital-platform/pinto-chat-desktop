@@ -1,0 +1,1480 @@
+//! Application state, replacing the Pinia stores (`auth`, `chats`,
+//! `messages`, `settings`). SQLite stays the source of truth for chats and
+//! messages; the in-memory lists here are a view of it for rendering.
+//!
+//! Network calls run on GPUI's background executor. Realtime frames arrive on
+//! a channel and are applied here on the UI thread, writing SQLite first.
+
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
+use futures::StreamExt;
+use gpui_kit::*;
+use serde_json::Value;
+
+use crate::{
+    api::{Api, ApiError},
+    db::Db,
+    env::{CHAT_PAGE_SIZE, Env, MESSAGE_PAGE_SIZE, TYPING_AUTO_CLEAR_MS},
+    models::{
+        Chat, ChatType, Message, MessageStatus, MessageType, OutboxItem, ReplyTarget, UserProfile,
+        new_id,
+    },
+    persist::{Settings, StoredSession},
+    realtime::{self, ChatEvent, ConnectionState, SocketHandle},
+};
+
+/// Auto-resend only what was written recently and has not kept failing.
+const OUTBOX_MAX_AGE_HOURS: i64 = 24;
+const OUTBOX_MAX_AUTO_RETRIES: i64 = 5;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Checking a stored token on launch.
+    Restoring,
+    SignedOut,
+    SignedIn,
+}
+
+pub enum StoreEvent {
+    SignedIn,
+    SignedOut,
+    Toast(SharedString),
+    /// A message arrived for a chat that is not open.
+    Notify {
+        title: String,
+        body: String,
+    },
+    /// The open chat got new rows; the room may want to stick to the bottom.
+    MessagesAppended,
+}
+
+#[derive(Clone)]
+pub enum RemoteImage {
+    Loading,
+    Ready(Arc<Image>),
+    Failed,
+}
+
+pub struct Store {
+    pub env: Env,
+    api: Api,
+    db: Option<Db>,
+    pub settings: Settings,
+
+    pub phase: Phase,
+    pub user: Option<UserProfile>,
+    pub auth_busy: bool,
+    pub auth_error: Option<String>,
+
+    chats: HashMap<String, Chat>,
+    pub selected_chat: Option<String>,
+    pub filter: Option<ChatType>,
+    pub search: String,
+    chat_page: usize,
+    pub chats_loading: bool,
+    pub chats_loading_more: bool,
+    pub chats_has_more: bool,
+    typing: HashSet<String>,
+    typing_epoch: HashMap<String, u64>,
+
+    messages: HashMap<String, Vec<Message>>,
+    pub messages_loading: bool,
+    pub messages_loading_more: bool,
+    pub messages_has_more: bool,
+
+    pub connection: ConnectionState,
+    socket: Option<SocketHandle>,
+    flushing: bool,
+    /// Pinned message per chat (`None` = loaded, nothing pinned).
+    pinned: HashMap<String, Option<String>>,
+    images: HashMap<String, RemoteImage>,
+    search_epoch: u64,
+}
+
+impl EventEmitter<StoreEvent> for Store {}
+
+impl Store {
+    pub fn new(env: Env, cx: &mut Context<Self>) -> Self {
+        let api = Api::new(env.api_base_url.clone());
+        let db = match Db::open(&crate::env::data_dir().join("pinto-chat.sqlite")) {
+            Ok(db) => Some(db),
+            Err(e) => {
+                log::error!("open database: {e:#}");
+                None
+            }
+        };
+        // Preview mode (debug only) never reads the real session or database.
+        let preview = cfg!(debug_assertions) && std::env::var("PINTO_PREVIEW").is_ok();
+        let db = if preview { None } else { db };
+        let session = if preview {
+            StoredSession::default()
+        } else {
+            StoredSession::load()
+        };
+        let phase = if session.access_token.is_some() {
+            Phase::Restoring
+        } else {
+            Phase::SignedOut
+        };
+        api.set_tokens(session.access_token.clone(), session.refresh_token.clone());
+
+        let mut this = Self {
+            env,
+            api,
+            db,
+            settings: Settings::load(),
+            phase,
+            user: None,
+            auth_busy: false,
+            auth_error: None,
+            chats: HashMap::new(),
+            selected_chat: None,
+            filter: None,
+            search: String::new(),
+            chat_page: 1,
+            chats_loading: false,
+            chats_loading_more: false,
+            chats_has_more: true,
+            typing: HashSet::new(),
+            typing_epoch: HashMap::new(),
+            messages: HashMap::new(),
+            messages_loading: false,
+            messages_loading_more: false,
+            messages_has_more: true,
+            connection: ConnectionState::Disconnected,
+            socket: None,
+            flushing: false,
+            pinned: HashMap::new(),
+            images: HashMap::new(),
+            search_epoch: 0,
+        };
+        if this.phase == Phase::Restoring {
+            this.restore_session(cx);
+        }
+        this
+    }
+
+    fn db(&self) -> Option<&Db> {
+        self.db.as_ref()
+    }
+
+    // ---- auth -----------------------------------------------------------
+
+    fn restore_session(&mut self, cx: &mut Context<Self>) {
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { api.profile() }).await;
+            this.update(cx, |this, cx| match result {
+                Ok(user) => this.finish_sign_in(user, cx),
+                // Same as `fetchProfile`: any failure drops the stored token.
+                Err(e) => {
+                    if e.status.is_none() {
+                        this.auth_error = Some(e.message);
+                    }
+                    this.clear_session(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn login(&mut self, identifier: String, password: String, cx: &mut Context<Self>) {
+        if self.auth_busy {
+            return;
+        }
+        self.auth_busy = true;
+        self.auth_error = None;
+        cx.notify();
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let tokens = api.login(&identifier, &password)?;
+                    api.set_tokens(
+                        Some(tokens.access_token.clone()),
+                        tokens.refresh_token.clone(),
+                    );
+                    let user = api.profile()?;
+                    Ok::<_, ApiError>((tokens, user))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.auth_busy = false;
+                match result {
+                    Ok((tokens, user)) => {
+                        StoredSession {
+                            access_token: Some(tokens.access_token),
+                            refresh_token: tokens.refresh_token,
+                        }
+                        .save();
+                        this.finish_sign_in(user, cx);
+                    }
+                    Err(e) => {
+                        this.api.set_tokens(None, None);
+                        this.auth_error = Some(e.message);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// QR login: tokens come from the WS; fall back to the WS user if the
+    /// profile endpoint fails, as `loginWithQrTokens` does.
+    pub fn login_with_tokens(
+        &mut self,
+        access: String,
+        refresh: Option<String>,
+        ws_user: Option<Value>,
+        cx: &mut Context<Self>,
+    ) {
+        self.auth_busy = true;
+        self.auth_error = None;
+        cx.notify();
+        StoredSession {
+            access_token: Some(access.clone()),
+            refresh_token: refresh.clone(),
+        }
+        .save();
+        self.api.set_tokens(Some(access), refresh);
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { api.profile() }).await;
+            this.update(cx, |this, cx| {
+                this.auth_busy = false;
+                match result
+                    .ok()
+                    .or_else(|| ws_user.as_ref().and_then(UserProfile::from_value))
+                {
+                    Some(user) => this.finish_sign_in(user, cx),
+                    None => {
+                        this.auth_error = Some("โหลดโปรไฟล์ไม่สำเร็จ".into());
+                        this.clear_session(cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_sign_in(&mut self, user: UserProfile, cx: &mut Context<Self>) {
+        self.user = Some(user);
+        self.phase = Phase::SignedIn;
+        self.load_cached_chats();
+        self.load_chats(true, cx);
+        self.connect_socket(cx);
+        self.flush_outbox(cx);
+        cx.emit(StoreEvent::SignedIn);
+        cx.notify();
+    }
+
+    /// Debug builds only: fills the store with sample rows so the chat screens
+    /// can be checked without an account. Nothing touches the network or SQLite.
+    #[cfg(debug_assertions)]
+    pub fn seed_preview(&mut self, cx: &mut Context<Self>) {
+        use chrono::{Duration as D, Utc};
+        let at = |mins: i64| (Utc::now() - D::minutes(mins)).to_rfc3339();
+        self.db = None;
+        self.user = Some(UserProfile {
+            user_id: "me".into(),
+            username: "nattapong.k".into(),
+            name: "ณัฐพงษ์ แก้วมณี".into(),
+            profile_image: None,
+        });
+        self.phase = Phase::SignedIn;
+        self.connection = ConnectionState::Connected;
+        let chats = [
+            (
+                "c1",
+                "direct",
+                "พลอยไพลิน ศรีสุข",
+                "พรุ่งนี้ประชุม 10 โมงนะ ส่งสไลด์ให้แล้ว",
+                4,
+                0,
+                true,
+            ),
+            (
+                "c2",
+                "group",
+                "ทีมขนส่ง ภาคเหนือ",
+                "รถเข้าคลังลำปางแล้ว 3 คัน",
+                12,
+                3,
+                false,
+            ),
+            (
+                "c3",
+                "direct",
+                "Somchai P.",
+                "โอเคครับ เดี๋ยวโทรกลับ",
+                95,
+                0,
+                false,
+            ),
+            (
+                "c4",
+                "group",
+                "Pinto Design",
+                "อัปเดตไอคอนชุดใหม่ใน Figma แล้ว",
+                60 * 20,
+                1,
+                false,
+            ),
+            ("c5", "direct", "กมลวรรณ ใจดี", "ขอบคุณค่ะ", 60 * 30, 0, false),
+            (
+                "c6",
+                "group",
+                "ฝ่ายบัญชี",
+                "ใบแจ้งหนี้เดือนตุลาคมครบแล้ว",
+                60 * 24 * 3,
+                0,
+                false,
+            ),
+            (
+                "c7",
+                "direct",
+                "อนุชา วงศ์ใหญ่",
+                "รับทราบครับ",
+                60 * 24 * 9,
+                0,
+                false,
+            ),
+        ];
+        for (id, kind, name, preview, mins, unread, pinned) in chats {
+            let mut c = Chat::from_value(&serde_json::json!({
+                "chat_id": id, "chat_type": kind, "name": name, "unread_count": unread,
+                "is_pinned": pinned, "updated_at": at(mins),
+                "last_message": { "message_id": format!("{id}-last"), "content": preview, "created_at": at(mins) }
+            }))
+            .unwrap();
+            c.is_pinned = pinned;
+            self.chats.insert(id.into(), c);
+        }
+        let thread = [
+            ("p", "เช้านี้ส่งไฟล์สรุปยอดให้แล้วนะ ดูทันไหม", 60 * 26, None),
+            ("me", "เห็นแล้ว ขอบคุณมาก", 60 * 25, None),
+            ("p", "พรุ่งนี้ประชุมกับทีมขนส่งกี่โมงนะ", 42, None),
+            (
+                "p",
+                "จะได้เตรียมตัวเลขไปด้วย ยอดส่งของภาคเหนือเดือนนี้เพิ่มขึ้นจากเดือนที่แล้วพอสมควร โดยเฉพาะเส้นทางเชียงใหม่ลำปางที่รถเต็มทุกเที่ยวตั้งแต่สัปดาห์ที่สอง",
+                41,
+                None,
+            ),
+            ("me", "10 โมงที่ห้องประชุมชั้น 4", 30, Some("m3")),
+            ("me", "เอาตัวเลขเดือนตุลาไปด้วยก็ดี", 29, None),
+            ("p", "ได้เลย", 6, None),
+            ("p", "พรุ่งนี้ประชุม 10 โมงนะ ส่งสไลด์ให้แล้ว", 4, None),
+            (
+                "p",
+                "สไลด์อยู่ที่ https://pinto-app.com/decks/north-oct นะ",
+                3,
+                None,
+            ),
+            ("me", "ได้รับแล้ว เดี๋ยวเปิดดูคืนนี้", 2, None),
+        ];
+        let msgs: Vec<Message> = thread
+            .iter()
+            .enumerate()
+            .map(|(i, (who, text, mins, reply))| {
+                let mut m = Message::from_value(&serde_json::json!({
+                    "message_id": format!("m{}", i + 1), "chat_id": "c1",
+                    "sender_id": if *who == "me" { "me" } else { "u-ploy" },
+                    "sender": { "name": "พลอยไพลิน ศรีสุข" },
+                    "content": text, "created_at": at(*mins), "reply_to": reply,
+                }));
+                if i == 5 {
+                    m.status = MessageStatus::Read;
+                }
+                if i == 9 {
+                    m.status = MessageStatus::Failed;
+                }
+                m
+            })
+            .collect();
+        let mut msgs = msgs;
+        let mut file = Message::from_value(&serde_json::json!({
+            "message_id": "m-file", "chat_id": "c1", "sender_id": "u-ploy", "message_type": "file",
+            "media": {"url": "https://pinto-app.com/files/north-oct.pdf", "name": "สรุปยอดภาคเหนือ ต.ค.pdf", "size": 1_482_000},
+            "created_at": at(60 * 25 + 30),
+        }));
+        file.status = MessageStatus::Sent;
+        msgs.insert(1, file);
+        self.messages.insert("c1".into(), msgs);
+        self.pinned.insert("c1".into(), Some("m3".into()));
+        if let Some(c) = self.chats.get_mut("c3") {
+            c.is_muted = true;
+        }
+        let mode = std::env::var("PINTO_PREVIEW").unwrap_or_default();
+        self.selected_chat = mode.contains("room").then(|| "c1".to_string());
+        if mode.contains("dark") {
+            self.settings.theme = crate::persist::ThemeMode::Dark;
+        }
+        cx.emit(StoreEvent::SignedIn);
+        cx.notify();
+    }
+
+    pub fn logout(&mut self, cx: &mut Context<Self>) {
+        // Snapshot the tokens: clear_session wipes the shared ones right after.
+        let api = self.api.detached();
+        cx.background_spawn(async move {
+            let _ = api.logout();
+        })
+        .detach();
+        self.clear_session(cx);
+    }
+
+    fn clear_session(&mut self, cx: &mut Context<Self>) {
+        StoredSession::clear();
+        self.api.set_tokens(None, None);
+        self.socket = None;
+        self.connection = ConnectionState::Disconnected;
+        self.user = None;
+        self.phase = Phase::SignedOut;
+        self.chats.clear();
+        self.messages.clear();
+        self.selected_chat = None;
+        cx.emit(StoreEvent::SignedOut);
+        cx.notify();
+    }
+
+    // ---- settings -------------------------------------------------------
+
+    pub fn update_settings(&mut self, f: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
+        f(&mut self.settings);
+        self.settings.save();
+        cx.notify();
+    }
+
+    // ---- chats ----------------------------------------------------------
+
+    fn load_cached_chats(&mut self) {
+        if let Some(rows) = self.db().and_then(|db| db.all_chats().ok()) {
+            for c in rows {
+                self.chats.insert(c.chat_id.clone(), c);
+            }
+        }
+    }
+
+    pub fn load_chats(&mut self, reset: bool, cx: &mut Context<Self>) {
+        if self.phase != Phase::SignedIn && self.user.is_none() {
+            return;
+        }
+        if reset {
+            self.chat_page = 1;
+            self.chats_has_more = true;
+        } else if self.chats_loading || self.chats_loading_more || !self.chats_has_more {
+            return;
+        }
+        self.chats_loading = reset && self.chats.is_empty();
+        self.chats_loading_more = !reset;
+        cx.notify();
+
+        let api = self.api.clone();
+        let (page, q, kind) = (self.chat_page, self.search.clone(), self.filter);
+        let epoch = self.search_epoch;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { api.chats(page, CHAT_PAGE_SIZE, Some(&q), kind) })
+                .await;
+            this.update(cx, |this, cx| {
+                if epoch != this.search_epoch {
+                    return; // a newer search replaced this one
+                }
+                this.chats_loading = false;
+                this.chats_loading_more = false;
+                match result {
+                    Ok(page) => {
+                        if let Some(db) = this.db()
+                            && let Err(e) = db.upsert_chats(&page.chats)
+                        {
+                            log::warn!("cache chats: {e:#}");
+                        }
+                        if reset && (!this.search.is_empty() || this.filter.is_some()) {
+                            this.chats.clear();
+                        }
+                        this.chats_has_more = page.chats.len() == CHAT_PAGE_SIZE;
+                        for c in page.chats {
+                            this.chats.insert(c.chat_id.clone(), c);
+                        }
+                        this.chat_page += 1;
+                    }
+                    Err(e) => log::warn!("load chats: {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Pinned first, then newest activity. Filter and search apply locally
+    /// too, so cached rows narrow immediately while the API catches up.
+    pub fn sorted_chats(&self) -> Vec<Chat> {
+        let q = self.search.to_lowercase();
+        let mut list: Vec<Chat> = self
+            .chats
+            .values()
+            .filter(|c| !c.is_deleted)
+            .filter(|c| self.filter.is_none_or(|f| c.chat_type == f))
+            .filter(|c| {
+                q.is_empty()
+                    || c.display_name().to_lowercase().contains(&q)
+                    || c.last_message_preview
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
+            })
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| {
+            b.is_pinned
+                .cmp(&a.is_pinned)
+                .then_with(|| b.sort_time().cmp(&a.sort_time()))
+        });
+        list
+    }
+
+    pub fn chat_type(&self, id: &str) -> Option<ChatType> {
+        self.chats.get(id).map(|c| c.chat_type)
+    }
+
+    pub fn selected(&self) -> Option<&Chat> {
+        self.selected_chat
+            .as_deref()
+            .and_then(|id| self.chats.get(id))
+    }
+
+    pub fn total_unread(&self) -> i64 {
+        self.chats.values().map(|c| c.unread_count).sum()
+    }
+
+    pub fn is_typing(&self, chat_id: &str) -> bool {
+        self.typing.contains(chat_id)
+    }
+
+    pub fn set_filter(&mut self, filter: Option<ChatType>, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter;
+        self.search_epoch += 1;
+        self.load_chats(true, cx);
+    }
+
+    /// Debounced in the view; this runs the query.
+    pub fn set_search(&mut self, q: String, cx: &mut Context<Self>) {
+        if self.search == q {
+            return;
+        }
+        self.search = q;
+        self.search_epoch += 1;
+        if self.search.is_empty() && self.filter.is_none() {
+            self.load_cached_chats();
+        }
+        self.load_chats(true, cx);
+    }
+
+    pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        if self.selected_chat == chat_id {
+            return;
+        }
+        self.selected_chat = chat_id.clone();
+        if let Some(id) = chat_id {
+            self.load_pin(&id);
+            self.load_messages(&id, cx);
+            self.mark_read(&id, cx);
+        }
+        cx.notify();
+    }
+
+    // ---- local-only chat features --------------------------------------
+    // Mute, pin and export live in SQLite on this device; nothing is sent
+    // to the server, so they do not follow the account to other devices.
+
+    pub fn toggle_mute(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(chat_id) else {
+            return;
+        };
+        chat.is_muted = !chat.is_muted;
+        let muted = chat.is_muted;
+        if let Some(db) = self.db() {
+            let _ = db.set_chat_muted(chat_id, muted);
+        }
+        cx.emit(StoreEvent::Toast(
+            if muted {
+                "ปิดเสียงแชทนี้แล้ว"
+            } else {
+                "เปิดเสียงแชทนี้แล้ว"
+            }
+            .into(),
+        ));
+        cx.notify();
+    }
+
+    pub fn pinned_message(&self, chat_id: &str) -> Option<Message> {
+        let id = self.pinned.get(chat_id)?.clone()?;
+        self.messages(chat_id)
+            .iter()
+            .find(|m| m.message_id == id)
+            .cloned()
+            .or_else(|| self.db()?.message(&id).ok().flatten())
+    }
+
+    fn load_pin(&mut self, chat_id: &str) {
+        if !self.pinned.contains_key(chat_id) {
+            let id = self
+                .db()
+                .and_then(|db| db.meta_get(&format!("pin:{chat_id}")).ok().flatten());
+            self.pinned.insert(chat_id.to_string(), id);
+        }
+    }
+
+    pub fn set_pin(&mut self, chat_id: &str, message_id: Option<String>, cx: &mut Context<Self>) {
+        if let Some(db) = self.db() {
+            let _ = db.meta_set(&format!("pin:{chat_id}"), message_id.as_deref());
+        }
+        let pinned = message_id.is_some();
+        self.pinned.insert(chat_id.to_string(), message_id);
+        cx.emit(StoreEvent::Toast(
+            if pinned {
+                "ปักหมุดข้อความแล้ว"
+            } else {
+                "เลิกปักหมุดแล้ว"
+            }
+            .into(),
+        ));
+        cx.notify();
+    }
+
+    pub fn is_pinned(&self, chat_id: &str, message_id: &str) -> bool {
+        self.pinned.get(chat_id).and_then(|p| p.as_deref()) == Some(message_id)
+    }
+
+    /// Everything stored for a chat, for the media panel and export. Falls
+    /// back to the loaded rows when there is no database (preview).
+    pub fn all_messages(&self, chat_id: &str) -> Vec<Message> {
+        match self.db().and_then(|db| db.all_messages(chat_id).ok()) {
+            Some(rows) if !rows.is_empty() => rows,
+            _ => self.messages(chat_id).to_vec(),
+        }
+    }
+
+    /// Plain-text transcript, one line per message.
+    pub fn export_text(&self, chat_id: &str) -> String {
+        let title = self
+            .chats
+            .get(chat_id)
+            .map(|c| c.display_name().to_string())
+            .unwrap_or_default();
+        let mut out = format!(
+            "แชท: {title}\nส่งออกจาก {} เมื่อ {}\n\n",
+            crate::env::APP_NAME,
+            chrono::Local::now().format("%d/%m/%Y %H:%M")
+        );
+        let mut day = String::new();
+        for m in self.all_messages(chat_id) {
+            let local = crate::models::parse_time(&m.created_at).with_timezone(&chrono::Local);
+            let d = local.format("%d/%m/%Y").to_string();
+            if d != day {
+                out.push_str(&format!("\n— {d} —\n"));
+                day = d;
+            }
+            let body = match m.message_type {
+                MessageType::Image => {
+                    format!("[รูปภาพ] {}", m.media_url.clone().unwrap_or_default())
+                }
+                MessageType::File => format!(
+                    "[ไฟล์] {} {}",
+                    m.file_name.clone().unwrap_or_default(),
+                    m.media_url.clone().unwrap_or_default()
+                ),
+                _ => m.text().to_string(),
+            };
+            out.push_str(&format!(
+                "{} {}: {}\n",
+                local.format("%H:%M"),
+                self.sender_name(&m),
+                body.trim()
+            ));
+        }
+        out
+    }
+
+    fn mark_read(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if let Some(c) = self.chats.get_mut(chat_id) {
+            if c.unread_count == 0 {
+                return;
+            }
+            c.unread_count = 0;
+        }
+        if let Some(db) = self.db() {
+            let _ = db.set_unread(chat_id, 0);
+            let _ = db.mark_chat_read(chat_id);
+        }
+        let api = self.api.clone();
+        let id = chat_id.to_string();
+        cx.background_spawn(async move {
+            if let Err(e) = api.mark_chat_read(&id) {
+                log::warn!("mark read: {e}");
+            }
+        })
+        .detach();
+    }
+
+    fn set_typing(&mut self, chat_id: &str, on: bool, cx: &mut Context<Self>) {
+        let epoch = self.typing_epoch.entry(chat_id.to_string()).or_default();
+        *epoch += 1;
+        let current = *epoch;
+        if on {
+            self.typing.insert(chat_id.to_string());
+            let id = chat_id.to_string();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(TYPING_AUTO_CLEAR_MS))
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.typing_epoch.get(&id) == Some(&current) {
+                        this.typing.remove(&id);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        } else {
+            self.typing.remove(chat_id);
+        }
+        cx.notify();
+    }
+
+    pub fn send_typing(&self, chat_id: &str, cx: &mut Context<Self>) {
+        let api = self.api.clone();
+        let id = chat_id.to_string();
+        cx.background_spawn(async move {
+            let _ = api.send_typing(&id);
+        })
+        .detach();
+    }
+
+    fn touch_chat(&mut self, chat_id: &str, message_id: &str, preview: &str, at: &str) {
+        let preview: String = preview.chars().take(100).collect();
+        if let Some(c) = self.chats.get_mut(chat_id) {
+            c.last_message_id = Some(message_id.to_string());
+            c.last_message_preview = Some(preview.clone());
+            c.last_message_at = Some(at.to_string());
+        }
+        if let Some(db) = self.db() {
+            let _ = db.update_chat_last_message(chat_id, message_id, &preview, at);
+        }
+    }
+
+    // ---- messages -------------------------------------------------------
+
+    pub fn messages(&self, chat_id: &str) -> &[Message] {
+        self.messages.get(chat_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn reply_target(&self, chat_id: &str, message_id: &str) -> Option<ReplyTarget> {
+        let m = self
+            .messages(chat_id)
+            .iter()
+            .find(|m| m.message_id == message_id)
+            .cloned()
+            .or_else(|| self.db()?.message(message_id).ok().flatten())?;
+        Some(ReplyTarget {
+            message_id: m.message_id.clone(),
+            sender_name: self.sender_name(&m),
+            content: m.text().to_string(),
+        })
+    }
+
+    pub fn is_self(&self, m: &Message) -> bool {
+        match (&self.user, &m.sender_id) {
+            (Some(u), Some(s)) => &u.user_id == s,
+            _ => false,
+        }
+    }
+
+    pub fn sender_name(&self, m: &Message) -> String {
+        if self.is_self(m) {
+            return "คุณ".into();
+        }
+        m.sender()
+            .name
+            .or_else(|| {
+                let chat = self.chats.get(&m.chat_id)?;
+                (chat.chat_type == ChatType::Direct).then(|| chat.display_name().to_string())
+            })
+            .unwrap_or_else(|| "ไม่ทราบชื่อ".into())
+    }
+
+    /// Local rows first; only an empty cache goes to the API.
+    fn load_messages(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.messages_has_more = true;
+        let local = self
+            .db()
+            .and_then(|db| db.messages(chat_id, MESSAGE_PAGE_SIZE, None).ok())
+            .unwrap_or_default();
+        if !local.is_empty() {
+            self.messages_has_more = local.len() == MESSAGE_PAGE_SIZE;
+            self.messages
+                .insert(chat_id.to_string(), local.into_iter().rev().collect());
+            cx.emit(StoreEvent::MessagesAppended);
+            cx.notify();
+            return;
+        }
+        self.messages_loading = true;
+        cx.notify();
+        let api = self.api.clone();
+        let id = chat_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let fetch_id = id.clone();
+            let result = cx
+                .background_spawn(async move { api.legacy_history(&fetch_id, MESSAGE_PAGE_SIZE) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.messages_loading = false;
+                match result {
+                    Ok(rows) => {
+                        let mut list: Vec<Message> = rows
+                            .iter()
+                            .map(|raw| {
+                                let mut m = Message::from_value(raw);
+                                if m.chat_id.is_empty() {
+                                    m.chat_id = id.clone();
+                                }
+                                m
+                            })
+                            .collect();
+                        if let Some(db) = this.db() {
+                            for m in &list {
+                                let _ = db.upsert_message(m);
+                            }
+                        }
+                        this.messages_has_more = list.len() == MESSAGE_PAGE_SIZE;
+                        list.sort_by_key(|m| crate::models::parse_time(&m.created_at));
+                        this.messages.insert(id.clone(), list);
+                        cx.emit(StoreEvent::MessagesAppended);
+                    }
+                    Err(e) => cx.emit(StoreEvent::Toast(format!("โหลดข้อความไม่สำเร็จ: {e}").into())),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn load_older(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if !self.messages_has_more || self.messages_loading_more {
+            return;
+        }
+        let Some(oldest) = self.messages(chat_id).first().map(|m| m.created_at.clone()) else {
+            return;
+        };
+        let older = self
+            .db()
+            .and_then(|db| db.messages(chat_id, MESSAGE_PAGE_SIZE, Some(&oldest)).ok())
+            .unwrap_or_default();
+        self.messages_has_more = older.len() == MESSAGE_PAGE_SIZE;
+        if !older.is_empty() {
+            let list = self.messages.entry(chat_id.to_string()).or_default();
+            let mut merged: Vec<Message> = older.into_iter().rev().collect();
+            merged.append(list);
+            *list = merged;
+        }
+        cx.notify();
+    }
+
+    fn push_message(&mut self, m: Message) -> bool {
+        let list = self.messages.entry(m.chat_id.clone()).or_default();
+        if list.iter().any(|x| x.message_id == m.message_id) {
+            return false;
+        }
+        // A WS echo of our own optimistic send: adopt the server row in place.
+        if let Some(temp) = m.client_temp_id.as_deref()
+            && let Some(x) = list
+                .iter_mut()
+                .find(|x| x.client_temp_id.as_deref() == Some(temp))
+        {
+            *x = Message {
+                status: MessageStatus::Sent,
+                ..m
+            };
+            return false;
+        }
+        list.push(m);
+        true
+    }
+
+    fn replace_message(&mut self, chat_id: &str, temp_id: &str, f: impl FnOnce(&mut Message)) {
+        if let Some(list) = self.messages.get_mut(chat_id)
+            && let Some(m) = list
+                .iter_mut()
+                .find(|m| m.message_id == temp_id || m.client_temp_id.as_deref() == Some(temp_id))
+        {
+            f(m);
+        }
+    }
+
+    pub fn send_text(
+        &mut self,
+        chat_id: &str,
+        content: String,
+        reply_to: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(user) = self.user.clone() else {
+            return;
+        };
+        let temp = Message::temp(
+            chat_id,
+            &user.user_id,
+            &content,
+            MessageType::Text,
+            reply_to.clone(),
+        );
+        let outbox = OutboxItem {
+            id: new_id(),
+            chat_id: chat_id.to_string(),
+            client_temp_id: temp.message_id.clone(),
+            content: Some(content.clone()),
+            message_type: MessageType::Text,
+            reply_to: reply_to.clone(),
+            retry_count: 0,
+            created_at: crate::models::now_iso(),
+        };
+        if let Some(db) = self.db() {
+            let _ = db.outbox_insert(&outbox);
+            let _ = db.upsert_message(&temp);
+        }
+        self.push_message(temp.clone());
+        cx.emit(StoreEvent::MessagesAppended);
+        cx.notify();
+        self.dispatch_text(outbox, temp.created_at.clone(), cx);
+    }
+
+    fn send_request(api: &Api, item: &OutboxItem) -> Result<Value, ApiError> {
+        api.send_text(
+            &item.chat_id,
+            item.content.as_deref().unwrap_or(""),
+            item.reply_to.as_deref(),
+            &item.client_temp_id,
+        )
+    }
+
+    fn dispatch_text(&mut self, item: OutboxItem, created_at: String, cx: &mut Context<Self>) {
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let req = item.clone();
+            let result = cx
+                .background_spawn(async move { Self::send_request(&api, &req) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_send_result(&item, created_at, result, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_send_result(
+        &mut self,
+        item: &OutboxItem,
+        created_at: String,
+        result: Result<Value, ApiError>,
+        cx: &mut Context<Self>,
+    ) {
+        let temp_id = item.client_temp_id.clone();
+        match result {
+            Ok(raw) => {
+                let server = Message::from_value(&raw);
+                if let Some(db) = self.db() {
+                    let _ = db.confirm_temp_message(&temp_id, &server.message_id);
+                    let _ = db.outbox_remove(&item.id);
+                }
+                let id = server.message_id.clone();
+                // Drop a WS echo that may have landed first, then confirm the temp row.
+                if let Some(list) = self.messages.get_mut(&item.chat_id) {
+                    list.retain(|m| {
+                        !(m.message_id == id && m.client_temp_id.as_deref() != Some(&temp_id))
+                    });
+                }
+                self.replace_message(&item.chat_id, &temp_id, |m| {
+                    m.message_id = id.clone();
+                    m.status = MessageStatus::Sent;
+                    m.sequence_id = server.sequence_id;
+                });
+                let at = if server.created_at.is_empty() {
+                    created_at
+                } else {
+                    server.created_at.clone()
+                };
+                self.touch_chat(
+                    &item.chat_id,
+                    &id,
+                    item.content.as_deref().unwrap_or(""),
+                    &at,
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "send to {} failed ({:?}): {}",
+                    item.chat_id,
+                    e.status,
+                    e.message
+                );
+                if let Some(db) = self.db() {
+                    let _ = db.update_message_status(&temp_id, MessageStatus::Failed);
+                    let _ = db.outbox_failed(&item.id, &e.message);
+                }
+                self.replace_message(&item.chat_id, &temp_id, |m| {
+                    m.status = MessageStatus::Failed
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn retry(&mut self, chat_id: &str, message_id: &str, cx: &mut Context<Self>) {
+        let Some(m) = self
+            .messages(chat_id)
+            .iter()
+            .find(|m| m.message_id == message_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(content) = m.content.clone() else {
+            return;
+        };
+        let temp_id = m.client_temp_id.clone().unwrap_or(m.message_id.clone());
+        self.replace_message(chat_id, &temp_id, |m| m.status = MessageStatus::Sending);
+        if let Some(db) = self.db() {
+            let _ = db.update_message_status(&m.message_id, MessageStatus::Sending);
+            let _ = db.outbox_remove_by_temp(&temp_id);
+        }
+        let item = OutboxItem {
+            id: new_id(),
+            chat_id: chat_id.to_string(),
+            client_temp_id: temp_id,
+            content: Some(content),
+            message_type: MessageType::Text,
+            reply_to: m.reply_to.clone(),
+            retry_count: 0,
+            created_at: crate::models::now_iso(),
+        };
+        if let Some(db) = self.db() {
+            let _ = db.outbox_insert(&item);
+        }
+        cx.notify();
+        self.dispatch_text(item, m.created_at, cx);
+    }
+
+    /// Retries queued and failed sends after (re)connecting.
+    /// Retries queued sends after sign-in or a reconnect. Only recent items with
+    /// few attempts go out automatically, one at a time, and a 429 stops the
+    /// run. Anything older keeps its failed state and waits for a manual retry,
+    /// so stale messages are never sent long after they were written.
+    fn flush_outbox(&mut self, cx: &mut Context<Self>) {
+        if self.flushing {
+            return;
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(OUTBOX_MAX_AGE_HOURS);
+        let pending: Vec<_> = self
+            .db()
+            .and_then(|db| db.outbox_pending().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|i| i.message_type == MessageType::Text)
+            .filter(|i| i.retry_count < OUTBOX_MAX_AUTO_RETRIES)
+            .filter(|i| crate::models::parse_time(&i.created_at) > cutoff)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        self.flushing = true;
+        for item in &pending {
+            self.replace_message(&item.chat_id, &item.client_temp_id, |m| {
+                m.status = MessageStatus::Sending
+            });
+        }
+        cx.notify();
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            for item in pending {
+                let req = item.clone();
+                let api = api.clone();
+                let result = cx
+                    .background_spawn(async move { Self::send_request(&api, &req) })
+                    .await;
+                let limited = matches!(
+                    &result,
+                    Err(ApiError {
+                        status: Some(429),
+                        ..
+                    })
+                );
+                let created = item.created_at.clone();
+                if this
+                    .update(cx, |this, cx| {
+                        this.apply_send_result(&item, created, result, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if limited {
+                    log::warn!("outbox flush stopped: rate limited");
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+            }
+            this.update(cx, |this, _| this.flushing = false).ok();
+        })
+        .detach();
+    }
+
+    pub fn send_file(
+        &mut self,
+        chat_id: &str,
+        path: PathBuf,
+        reply_to: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(user) = self.user.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let is_image = matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp")
+        );
+        let kind = if is_image {
+            MessageType::Image
+        } else {
+            MessageType::File
+        };
+        let mut temp = Message::temp(chat_id, &user.user_id, "", kind, reply_to.clone());
+        temp.content = None;
+        temp.file_name = Some(name);
+        temp.file_size = std::fs::metadata(&path).ok().map(|m| m.len() as i64);
+        if let Some(db) = self.db() {
+            let _ = db.upsert_message(&temp);
+        }
+        let temp_id = temp.message_id.clone();
+        self.push_message(temp);
+        cx.emit(StoreEvent::MessagesAppended);
+        cx.notify();
+
+        let api = self.api.clone();
+        let chat = chat_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let (c, r) = (chat.clone(), reply_to.clone());
+            let result = cx
+                .background_spawn({
+                    let id = temp_id.clone();
+                    async move { api.send_file(&c, &path, r.as_deref(), &id) }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(raw) => {
+                        let server = Message::from_value(&raw);
+                        if let Some(db) = this.db() {
+                            let _ = db.confirm_temp_message(&temp_id, &server.message_id);
+                        }
+                        this.replace_message(&chat, &temp_id, |m| {
+                            m.message_id = server.message_id.clone();
+                            m.status = MessageStatus::Sent;
+                            m.media_url = server.media_url.clone();
+                            m.sequence_id = server.sequence_id;
+                        });
+                    }
+                    Err(e) => {
+                        if let Some(db) = this.db() {
+                            let _ = db.update_message_status(&temp_id, MessageStatus::Failed);
+                        }
+                        this.replace_message(&chat, &temp_id, |m| m.status = MessageStatus::Failed);
+                        cx.emit(StoreEvent::Toast(format!("ส่งไฟล์ไม่สำเร็จ: {e}").into()));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Hides the message on this device only, as the Vue build does.
+    pub fn delete_message(&mut self, chat_id: &str, message_id: &str, cx: &mut Context<Self>) {
+        if let Some(db) = self.db() {
+            let _ = db.mark_message_deleted(message_id);
+        }
+        if let Some(list) = self.messages.get_mut(chat_id) {
+            list.retain(|m| m.message_id != message_id);
+        }
+        cx.emit(StoreEvent::Toast("ลบข้อความแล้ว".into()));
+        cx.notify();
+    }
+
+    /// Fetches a missing `sequence_id` range (500 per request), stores it and
+    /// merges it into the open list in time order.
+    fn repair(&mut self, chat_id: &str, from: i64, to: i64, cx: &mut Context<Self>) {
+        log::info!("repair {chat_id} sequence {from}..={to}");
+        let api = self.api.clone();
+        let chat = chat_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let id = chat.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let mut all = Vec::new();
+                    let mut start = from;
+                    while start <= to {
+                        let end = (start + 499).min(to);
+                        all.extend(api.repair(&id, start, end)?);
+                        start = end + 1;
+                    }
+                    Ok::<_, ApiError>(all)
+                })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(rows) => {
+                    let mut added = false;
+                    for raw in &rows {
+                        let mut m = Message::from_value(raw);
+                        if m.chat_id.is_empty() {
+                            m.chat_id = chat.clone();
+                        }
+                        if let Some(db) = this.db() {
+                            let _ = db.upsert_message(&m);
+                        }
+                        added |= this.push_message(m);
+                    }
+                    if added {
+                        if let Some(list) = this.messages.get_mut(&chat) {
+                            list.sort_by_key(|m| {
+                                (crate::models::parse_time(&m.created_at), m.sequence_id)
+                            });
+                        }
+                        cx.emit(StoreEvent::MessagesAppended);
+                        cx.notify();
+                    }
+                }
+                Err(e) => log::warn!("repair {chat}: {e}"),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ---- realtime -------------------------------------------------------
+
+    fn connect_socket(&mut self, cx: &mut Context<Self>) {
+        if StoredSession::load().access_token.is_none() {
+            return;
+        }
+        let env = self.env.clone();
+        // Read the token on every (re)connect: the API client may have refreshed it.
+        let url = move || {
+            StoredSession::load()
+                .access_token
+                .map(|t| env.chat_ws_url(&t))
+        };
+        let (handle, mut rx) = realtime::spawn_chat_socket(url);
+        self.socket = Some(handle);
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.on_chat_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn on_chat_event(&mut self, event: ChatEvent, cx: &mut Context<Self>) {
+        match event {
+            ChatEvent::State(state) => {
+                let reconnected = state == ConnectionState::Connected
+                    && self.connection != ConnectionState::Connected;
+                self.connection = state;
+                if reconnected {
+                    self.flush_outbox(cx);
+                }
+                cx.notify();
+            }
+            ChatEvent::Frame { kind, data } => self.on_frame(&kind, &data, cx),
+        }
+    }
+
+    fn on_frame(&mut self, kind: &str, data: &Value, cx: &mut Context<Self>) {
+        let chat_id = data
+            .get("chat_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match kind {
+            "new_message" => {
+                let msg = Message::from_value(data);
+                if msg.chat_id.is_empty() {
+                    return;
+                }
+                // A jump in sequence_id means messages were missed: fetch the gap.
+                if let (Some(seq), Some(last)) = (
+                    msg.sequence_id,
+                    self.db()
+                        .and_then(|db| db.max_sequence(&msg.chat_id).ok().flatten()),
+                ) && seq > last + 1
+                {
+                    self.repair(&msg.chat_id, last + 1, seq - 1, cx);
+                }
+                if let Some(db) = self.db() {
+                    let _ = db.upsert_message(&msg);
+                }
+                let own = self.is_self(&msg);
+                let open = self.selected_chat.as_deref() == Some(&msg.chat_id);
+                self.touch_chat(&msg.chat_id, &msg.message_id, msg.text(), &msg.created_at);
+                self.set_typing(&msg.chat_id, false, cx);
+                let added = self.push_message(msg.clone());
+                if open {
+                    if added {
+                        cx.emit(StoreEvent::MessagesAppended);
+                    }
+                    self.mark_read(&msg.chat_id, cx);
+                } else if !own {
+                    let unread = self
+                        .chats
+                        .get(&msg.chat_id)
+                        .map(|c| c.unread_count + 1)
+                        .unwrap_or(1);
+                    if let Some(c) = self.chats.get_mut(&msg.chat_id) {
+                        c.unread_count = unread;
+                    }
+                    if let Some(db) = self.db() {
+                        let _ = db.set_unread(&msg.chat_id, unread);
+                    }
+                    if !self.chats.contains_key(&msg.chat_id) {
+                        self.load_chats(true, cx);
+                    }
+                    let muted = self.chats.get(&msg.chat_id).is_some_and(|c| c.is_muted);
+                    if self.settings.notifications_enabled && !muted {
+                        let title = self
+                            .chats
+                            .get(&msg.chat_id)
+                            .map(|c| c.display_name().to_string())
+                            .unwrap_or_else(|| "ข้อความใหม่".into());
+                        let body = if self.settings.show_preview {
+                            msg.content.clone().unwrap_or_else(|| "ส่งไฟล์".into())
+                        } else {
+                            "ข้อความใหม่".into()
+                        };
+                        cx.emit(StoreEvent::Notify { title, body });
+                    }
+                }
+                cx.notify();
+            }
+            "typing" => {
+                let on = data
+                    .get("is_typing")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if !chat_id.is_empty() {
+                    self.set_typing(&chat_id, on, cx);
+                }
+            }
+            "stop_typing" => {
+                if !chat_id.is_empty() {
+                    self.set_typing(&chat_id, false, cx);
+                }
+            }
+            "read_receipt" => {
+                if let Some(id) = data.get("message_id").and_then(Value::as_str) {
+                    if let Some(db) = self.db() {
+                        let _ = db.mark_message_read(id);
+                        let _ = db.update_message_status(id, MessageStatus::Read);
+                    }
+                    for list in self.messages.values_mut() {
+                        if let Some(m) = list.iter_mut().find(|m| m.message_id == id) {
+                            m.is_read = true;
+                            m.status = MessageStatus::Read;
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- images ---------------------------------------------------------
+
+    /// Avatars and image messages. Returns `None` until the bytes arrive.
+    pub fn image(&mut self, url: &str, cx: &mut Context<Self>) -> Option<Arc<Image>> {
+        match self.images.get(url) {
+            Some(RemoteImage::Ready(img)) => return Some(img.clone()),
+            Some(_) => return None,
+            None => {}
+        }
+        self.images.insert(url.to_string(), RemoteImage::Loading);
+        let api = self.api.clone();
+        let key = url.to_string();
+        cx.spawn(async move |this, cx| {
+            let url = key.clone();
+            let result = cx
+                .background_spawn(async move { api.fetch_bytes(&url) })
+                .await;
+            this.update(cx, |this, cx| {
+                let state = match result.ok().and_then(|bytes| Some((sniff(&bytes)?, bytes))) {
+                    Some((format, bytes)) => {
+                        RemoteImage::Ready(Arc::new(Image::from_bytes(format, bytes)))
+                    }
+                    None => RemoteImage::Failed,
+                };
+                this.images.insert(key, state);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        None
+    }
+}
+
+fn sniff(b: &[u8]) -> Option<ImageFormat> {
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some(ImageFormat::Png)
+    } else if b.starts_with(&[0xFF, 0xD8]) {
+        Some(ImageFormat::Jpeg)
+    } else if b.starts_with(b"GIF8") {
+        Some(ImageFormat::Gif)
+    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else if b.starts_with(b"<svg") || b.starts_with(b"<?xml") {
+        Some(ImageFormat::Svg)
+    } else {
+        None
+    }
+}

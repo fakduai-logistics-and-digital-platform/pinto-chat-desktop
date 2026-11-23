@@ -5,230 +5,125 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Quick Start
 
 ```bash
-npm install
 cp .env.example .env
-npm run tauri dev
+cargo run
 ```
 
 ## Development Commands
 
-**Development mode** (Vite dev server + Tauri app window):
 ```bash
-npm run tauri dev
+cargo run                     # debug build + app window
+cargo test                    # unit tests (db, realtime parsing, formatting)
+cargo clippy                  # lints; keep at zero warnings
+cargo fmt                     # format
+cargo build --release         # optimized binary: target/release/pinto-chat
 ```
 
-**Type check only**:
-```bash
-npx vue-tsc --noEmit
-```
+**Preview mode** (debug builds only): sample data, no network, never reads the real session or database. Use it to check UI without signing in.
 
-**Build frontend only**:
 ```bash
-npx vite build
-```
-
-**Build full production app**:
-```bash
-npm run tauri build
+PINTO_PREVIEW=list cargo run        # chat list
+PINTO_PREVIEW=room cargo run        # open conversation
+PINTO_PREVIEW=room-dark cargo run   # dark theme
+PINTO_PREVIEW=settings cargo run    # settings page
 ```
 
 ## Project Architecture
 
-**Pinto Chat Desktop** is a local-first, realtime chat application built with Tauri v2 (Rust backend) + Vue 3 (TypeScript frontend) + SQLite (local data store) + WebSocket (realtime updates).
+**Pinto Chat Desktop** is a local-first, realtime chat app: one native Rust binary built on **GPUI Kit** (`gpui-kit` 0.10 = GPUI + GPUI Base + GPUI Component), SQLite for local data, WebSocket for realtime. It replaced an earlier Tauri + Vue build (still in git history before the move).
 
-### Stack Overview
-- **Frontend**: Vue 3 + Vue Router + Pinia (UI state management)
-- **Build**: Vite + vue-tsc type checking
-- **Styling**: Tailwind CSS
-- **Desktop**: Tauri v2 (Rust runtime, provides OS-level APIs)
-- **Database**: SQLite (local-first, not cloud-backed)
-- **Realtime**: WebSocket (`/v1/ws/chat`)
-- **Auth**: JWT tokens (email/password or QR-code mobile confirmation)
+### Stack
+- **UI**: `gpui-kit` (`use gpui_kit::*;` is GPUI; components under `gpui_kit::component`, Lucide icons via `gpui_kit::assets::IconName`)
+- **HTTP**: `ureq` (blocking), always called inside `cx.background_spawn`
+- **Realtime**: `tungstenite` on dedicated threads, events sent over `futures` channels
+- **Database**: `rusqlite` (bundled SQLite)
+- **Auth**: JWT (email/password or QR confirmation from the mobile app)
 
-### Architectural Patterns
+### Architectural rules
 
-**Local-first source of truth**: All data (chats, messages, users) lives in SQLite. The API is for sync/realtime, not primary storage. Messages are fetched from the database, not the API.
+**Local-first source of truth**: chats and messages are written to SQLite first. `Store`'s in-memory lists are a view for rendering. Opening a chat reads SQLite; the API is only asked when the cache is empty.
 
-**State separation**:
-- **Pinia stores**: UI-only state (selected chat, connection status, loading flags, drafts)
-- **SQLite**: Persistent domain data (messages, chats, participants, outbox)
-- Never duplicate domain data in Pinia
+**One state entity**: `store::Store` (an `Entity<Store>`) replaces the old Pinia stores. Views hold `Entity<Store>`, observe it, and call its methods. Views keep UI-only state (scroll handles, input entities, open menus, reply target).
 
-**Realtime flow**: WebSocket pushes events → update SQLite → Pinia store reacts to DB changes. Never mutate Pinia from WS events directly.
+**Threading**: never block the UI thread. Network calls go through `cx.background_spawn(...)` and results are applied with `this.update(cx, ...)`. WebSocket threads never touch UI state; a GPUI task drains their channel and calls into `Store`.
 
-**Offline outbox**: Failed sends are queued in SQLite's `outbox` table and retried on reconnect. Check `outbox.service.ts` for the pattern.
+**Realtime flow**: WS frame → `Store::on_frame` → write SQLite → update in-memory view → `cx.notify()` / `StoreEvent`.
+
+**Offline outbox**: text sends go to `pending_outbox` before the request; failures mark the row and message `failed`; `flush_outbox` retries on sign-in and every reconnect. Failed bubbles offer a retry.
 
 ## Directory Structure
 
 ```
 src/
-├── app/
-│   ├── router.ts           # Vue Router configuration
-│   ├── env.ts              # Runtime environment variables (source of truth for API URLs)
-│   └── constants.ts        # App-wide constants
-├── features/               # Feature modules (auth, chats, messages, etc.)
-│   ├── auth/
-│   │   ├── auth.store.ts           # Pinia store (login state, current user)
-│   │   ├── auth.api.ts             # API calls (login, logout, refresh)
-│   │   ├── token-storage.ts        # Token persistence (localStorage/Tauri)
-│   │   ├── qr-login.service.ts     # QR login WebSocket flow
-│   │   └── auth.types.ts           # TypeScript types
-│   ├── chats/
-│   │   ├── chats.store.ts          # Pinia store (selected chat, chat list UI state)
-│   │   ├── chats.api.ts            # Chat API calls
-│   │   ├── chats.db.ts             # Chat database queries
-│   │   └── chats.types.ts
-│   ├── messages/
-│   │   ├── messages.store.ts       # Pinia store (message list UI state)
-│   │   ├── messages.api.ts         # Message API calls
-│   │   ├── messages.db.ts          # Message database queries
-│   │   ├── message-normalizer.ts   # Normalize/denormalize message data
-│   │   ├── outbox.service.ts       # Offline queue and retry logic
-│   │   └── messages.types.ts
-│   ├── realtime/
-│   │   ├── pinto-ws.client.ts      # WebSocket client (connect, listen, send)
-│   │   └── ws-events.ts            # Event type definitions
-│   ├── local-db/
-│   │   ├── db.client.ts            # SQLite initialization and migrations
-│   │   └── db.repositories.ts      # Database query layer
-│   ├── users/
-│   │   ├── users.api.ts
-│   │   └── users.types.ts
-│   ├── notifications/              # OS-level notifications (Tauri plugin)
-│   └── settings/
-│       └── settings.store.ts       # App settings (theme, notification prefs, etc.)
-├── layouts/
-│   ├── AuthLayout.vue      # Login page layout
-│   └── AppShell.vue        # Main app shell with sidebar, chat view
-├── pages/
-│   ├── LoginPage.vue       # QR code + email/password login
-│   ├── ChatPage.vue        # Main chat interface
-│   └── SettingsPage.vue    # Settings UI
-├── shared/
-│   ├── api/
-│   │   └── api-client.ts   # HTTP client (with JWT auth, error handling)
-│   ├── components/         # Reusable Vue components (MessageBubble, ChatList, etc.)
-│   └── utils/              # Utility functions (date formatting, text parsing, etc.)
-├── App.vue                 # Root component (router view + global setup)
-├── main.ts                 # Vue app entry point
-└── style.css               # Global styles
+├── main.rs        app start, bundled assets and fonts, window options
+├── env.rs         configuration + constants (source of truth for URLs)
+├── models.rs      Chat, Message, UserProfile, normalizers from API JSON
+├── api.rs         HTTP client and endpoints
+├── db.rs          SQLite schema, migrations and queries (+ tests)
+├── persist.rs     session.json and settings.json in the app data dir
+├── realtime.rs    chat and QR WebSocket threads (+ tests)
+├── store.rs       app state: auth, chats, messages, settings, images
+├── format.rs      Thai date/time/size formatting (+ tests)
+├── theme.rs       DESIGN.md palette (light + dark) mapped onto gpui-component
+└── ui/
+    ├── mod.rs     root view: screen switching, theme sync, toasts, notifications
+    ├── login.rs   QR login and email/password
+    ├── shell.rs   rail, chat list, user menu
+    ├── room.rs    header, messages, bubbles, menus, composer
+    ├── settings.rs
+    └── widgets.rs avatar, icon, badges, drag regions
+assets/
+├── fonts/         IBM Plex Sans Thai (Regular, Medium, SemiBold), embedded
+├── images/        logo, chat wallpaper pattern, embedded
+└── icons/         app icons (icns/ico/png) for bundling
 ```
 
 ## Key Implementation Details
 
-### Environment Configuration
-All API URLs come from `src/app/env.ts`, not `.env` directly. Modules import the `env` object from there.
-- `VITE_PINTO_API_BASE_URL` — REST API base
-- `VITE_PINTO_WS_URL` — WebSocket base for chat realtime
-- `VITE_PINTO_QR_AUTH_WS_URL` — QR login WebSocket (auto-derived if not set)
+### Environment
+`env::Env::load()` reads `.env` then the process env. Names: `PINTO_API_BASE_URL`, `PINTO_WS_URL`, `PINTO_QR_AUTH_WS_URL` (old `VITE_PINTO_*` names are still accepted). WS and QR URLs are derived from the API URL when unset.
 
-### Authentication Flow
+### Data location
+`~/Library/Application Support/com.pinto.chat-desktop/` (same identifier as the old Tauri build, so existing `pinto-chat.sqlite` opens as is): `pinto-chat.sqlite`, `session.json` (tokens), `settings.json`.
 
-**Email/Password**: POST to `/api/auth/login` → store JWT token in localStorage/Tauri → fetch profile.
+### Authentication
+- **Email/password**: `POST /api/auth/login` → store tokens → `GET /v1/users/profile`.
+- **QR**: `realtime::spawn_qr_socket` opens `/ws/auth/qr` → `init` gives `session_id` + expiry → render QR of `{type_mode:'scan_login', session_id}` → mobile confirms via `/api/auth/qr/confirm` → `login_success` delivers tokens → `Store::login_with_tokens`. Expired sessions reconnect after 3 s.
 
-**QR Code**: 
-1. Desktop opens WS to `/ws/auth/qr`
-2. Backend sends `init` with session_id + QR expires
-3. Desktop renders QR with `{type_mode: 'scan_login', session_id}`
-4. Mobile (already logged in) scans and POSTs `/api/auth/qr/confirm` with its token
-5. Backend validates mobile token, issues desktop tokens, pushes `login_success` to WS
-6. Desktop stores tokens and fetches profile
+### Database schema
+Created in `db::MIGRATIONS` (idempotent `CREATE ... IF NOT EXISTS`): `app_meta`, `users`, `chats`, `chat_participants`, `messages`, `message_read_states`, `pending_outbox`, `typing_states`, `bot_generating_states`. Add a table by appending to `MIGRATIONS` and adding query methods on `Db`, with a test.
 
-See `src/features/auth/qr-login.service.ts` for implementation.
+### WebSocket
+`/v1/ws/chat?token=...`, frames `{ type, data }`: `new_message`, `typing`, `stop_typing`, `read_receipt`. Reconnect delays 1/2/5/10/30 s.
 
-### Database Schema
-Tauri SQL plugin manages SQLite. Migrations run on app init in `src/features/local-db/db.client.ts`:
-- `users` — user profiles
-- `chats` — conversations (DMs and groups)
-- `messages` — message history
-- `outbox` — unsent/failed messages
-- `app_meta` — app metadata (last sync timestamp, etc.)
-
-All queries go through `src/features/local-db/db.repositories.ts`.
-
-### Message Flow
-1. User types → update Pinia draft
-2. Click send → create `outbox` row + POST to API
-3. API succeeds → mark in `messages` table
-4. API fails → leave in `outbox` + retry on reconnect
-5. WebSocket pushes new message → insert into `messages` + update `chats.last_message_at`
-6. Pinia store reacts to DB changes (queries are re-run)
-
-See `src/features/messages/outbox.service.ts` for retry logic.
-
-### WebSocket Connection
-Connected in `App.vue` after auth succeeds. Reconnects on network restore. See `src/features/realtime/pinto-ws.client.ts`:
-- `connect()` — open connection
-- `on(eventType, handler)` — register event listener
-- `send(message)` — push event to server
-- Auto-reconnect on drop
-
-### Store Pattern
-All Pinia stores use the Composition API pattern (`defineStore('name', () => { ... })`). Stores are **UI state only**:
-- Selected chat ID
-- Loading/error flags
-- Draft text
-- Connection status
-
-They do not duplicate domain data from SQLite. Instead, they subscribe to database changes (via `db.repositories`) and compute derived state via `computed()`.
+### Images
+Remote avatars and image messages are fetched by `Store::image(url, cx)` (bytes via `Api::fetch_bytes`, cached as `Arc<Image>`); it returns `None` until loaded.
 
 ## Design System
 
-**Read DESIGN.md before editing UI.** All color, typography, and spacing decisions come from there.
+**Read DESIGN.md before editing UI.** Colors, type and spacing come from there; `theme.rs` holds them as `Palette` (read with `cx.palette()`).
 
-- Primary color: `#2ECC71` (green)
-- Primary tint: `#EAFBF1`
-- Typography: IBM Plex Sans Thai (Display, Headline, Title scales)
-- Design philosophy: Bright, paper-flat, warm-ink typography
-
-When editing Vue templates or CSS:
-- Design review happens automatically via `.claude/settings.json` hook
-- Skills invoked: `/design-taste-frontend-v1` (editorial), `/industrial-brutalist-ui` (mechanical), `/brandkit` (brand)
-- Focus on color consistency, typography hierarchy, and spacing alignment
-
-Tailwind is configured with custom Pinto colors in `tailwind.config.js`.
-
-## Testing & Verification
-
-No test suite exists yet. To verify a change:
-1. Run `npm run tauri dev`
-2. Test the feature manually in the Tauri window
-3. Check browser DevTools (right-click → Inspect Element)
-4. Check SQLite directly if needed (Tauri doesn't expose a DB viewer yet)
+- Primary `#2ECC71`, tint `#EAFBF1`; warm ink text (`#433D4D` ramp); paper-flat, hairline borders, no glows or gradients.
+- Font: IBM Plex Sans Thai, weights 400/500/600.
+- Spacing on a 4px grid; icons are Lucide at one size per context.
+- Own message bubbles use dark ink on the green (white on `#2ECC71` fails contrast).
+- After changing `theme.rs`, rebuild `theme.tokens` from `colors` (already done in `theme::apply`) or components keep stale colors.
+- Verify UI changes with preview mode and a screenshot.
 
 ## Common Tasks
 
-**Add a new API endpoint**:
-1. Create a function in `src/features/[feature]/[feature].api.ts`
-2. Call `api()` from `src/shared/api/api-client.ts`
-3. Handle errors with a `.ok` / `.error` pattern
-4. Call from Pinia store actions
+**Add an API endpoint**: method on `Api` in `api.rs` returning `ApiResult<T>`; call it from `Store` inside `cx.background_spawn`.
 
-**Add a new database table**:
-1. Add migration in `src/features/local-db/db.client.ts` (in `runMigrations()`)
-2. Add repository functions in `src/features/local-db/db.repositories.ts`
-3. Call from feature stores/services
+**Add a screen**: view in `src/ui/`, add a variant to `Screen` in `ui/mod.rs`, navigate via an event the root subscribes to.
 
-**Add a new page/route**:
-1. Create `.vue` component in `src/pages/`
-2. Add route in `src/app/router.ts`
-3. Link from `AppShell.vue` or another page
-
-**Debug WebSocket events**:
-- Open browser DevTools console
-- WebSocket messages are logged in `src/features/realtime/pinto-ws.client.ts`
-- Check `pinto-ws.client.ts` for event handling logic
-
-## Performance Notes
-
-- Large message lists: use virtualization (not yet implemented, but `messages.store.ts` pagination pattern exists)
-- SQLite queries: keep them in `db.repositories.ts` for centralization and debugging
-- Pinia selectors: use `computed()` to avoid re-rendering on every dependency change
-- WebSocket: connection lifecycle is global, initialized once in `App.vue`
+**Debug realtime**: run with `RUST_LOG=debug cargo run`; socket errors log from `realtime.rs`.
 
 ## Known Limitations / TODOs
 
-- No offline-first sync conflict resolution yet (simple last-write-wins)
-- No encryption at rest
-- Message search not implemented
-- File/image uploads in progress
+- Thai line breaking only at spaces (no ICU4X Thai segmenter in this build).
+- Composer is single-line (Enter sends).
+- OS notifications need an `.app` bundle; not set up yet.
+- No sync conflict resolution (last write wins), no encryption at rest, no message search.
+- Local-only (this device, no sync): chat mute, pinned message, wallpaper, media/files/links panel, chat export. The API has endpoints to sync mute and media later.
+- Hidden until the API is wired: friends, add friend, open chats, forward, invite, poll, album, report, block.
+- Outbox auto-resend covers messages under 24 h with fewer than 5 attempts, one at a time, stopping on 429; older ones wait for a manual retry.
