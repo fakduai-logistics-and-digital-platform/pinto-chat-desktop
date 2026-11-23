@@ -6,7 +6,9 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{
     Sizable,
+    button::Button,
     input::{Input, InputEvent, InputState},
+    scroll::ScrollableElement,
     skeleton::Skeleton,
 };
 use gpui_kit::prelude::*;
@@ -15,7 +17,7 @@ use gpui_kit::*;
 use crate::{
     env::SEARCH_DEBOUNCE_MS,
     format,
-    models::{Chat, ChatType},
+    models::{Chat, ChatType, UserProfile},
     store::Store,
     theme::{Palette, PaletteExt},
     ui::{
@@ -24,7 +26,8 @@ use crate::{
     },
 };
 
-const RAIL_W: f32 = 76.;
+/// Narrow rail; the window controls overhang into the sidebar's empty top strip.
+const RAIL_W: f32 = 56.;
 
 pub enum ShellEvent {
     OpenSettings,
@@ -32,7 +35,31 @@ pub enum ShellEvent {
 
 impl EventEmitter<ShellEvent> for ShellView {}
 
+/// What the sidebar shows, picked from the rail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Friends,
+    Chats,
+    /// Find people by name or username and start a chat (bots too).
+    People,
+}
+
+/// Below this width the window shows one column at a time, like LINE's
+/// compact window: the list, or the open chat with a back button.
+pub const NARROW_W: f32 = 720.;
+
 pub struct ShellView {
+    people_search: Entity<InputState>,
+    people_focused: bool,
+    people_epoch: u64,
+    people_scroll: ScrollHandle,
+    narrow: bool,
+    friends_scroll: ScrollHandle,
+    /// Which search field has focus, for its border.
+    search_focused: bool,
+    friend_focused: bool,
+    section: Section,
+    friend_search: Entity<InputState>,
     store: Entity<Store>,
     room: Entity<RoomView>,
     search: Entity<InputState>,
@@ -46,6 +73,17 @@ impl ShellView {
         let room = cx.new(|cx| RoomView::new(store.clone(), window, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("ค้นหา"));
         cx.subscribe_in(&search, window, |this, input, ev: &InputEvent, _, cx| {
+            match ev {
+                InputEvent::Focus => {
+                    this.search_focused = true;
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.search_focused = false;
+                    cx.notify();
+                }
+                _ => {}
+            }
             if let InputEvent::Change = ev {
                 let q = input.read(cx).value().trim().to_string();
                 this.search_epoch += 1;
@@ -66,7 +104,67 @@ impl ShellView {
         })
         .detach();
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        let friend_search = cx.new(|cx| InputState::new(window, cx).placeholder("ค้นหาเพื่อน"));
+        cx.subscribe(&friend_search, |this, _, ev: &InputEvent, cx| {
+            match ev {
+                InputEvent::Focus => this.friend_focused = true,
+                InputEvent::Blur => this.friend_focused = false,
+                _ => {}
+            }
+            cx.notify();
+        })
+        .detach();
+        let people_search = cx.new(|cx| InputState::new(window, cx).placeholder("ชื่อหรือชื่อผู้ใช้"));
+        cx.subscribe(&people_search, |this, input, ev: &InputEvent, cx| {
+            match ev {
+                InputEvent::Focus => this.people_focused = true,
+                InputEvent::Blur => this.people_focused = false,
+                InputEvent::Change => {
+                    // Debounced: search once typing pauses.
+                    let q = input.read(cx).value().trim().to_string();
+                    this.people_epoch += 1;
+                    let epoch = this.people_epoch;
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(SEARCH_DEBOUNCE_MS + 100))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            if this.people_epoch == epoch {
+                                this.store.update(cx, |s, cx| s.search_people(q, cx));
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                _ => {}
+            }
+            cx.notify();
+        })
+        .detach();
+        let preview = if cfg!(debug_assertions) {
+            std::env::var("PINTO_PREVIEW").unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let section = if preview.contains("friends") {
+            Section::Friends
+        } else if preview.contains("people") {
+            Section::People
+        } else {
+            Section::Chats
+        };
         Self {
+            people_search,
+            people_focused: false,
+            people_epoch: 0,
+            people_scroll: ScrollHandle::new(),
+            narrow: false,
+            friends_scroll: ScrollHandle::new(),
+            search_focused: false,
+            friend_focused: false,
+            section,
+            friend_search,
             store,
             room,
             search,
@@ -99,44 +197,30 @@ impl ShellView {
             .bg(p.surface)
             .border_r_1()
             .border_color(p.divider)
-            .pb(px(16.))
-            .gap(px(8.))
+            .pb(px(12.))
+            .gap(px(4.))
             // The window controls sit in this strip; it also drags the window.
-            .child(drag_region(div().h(px(40.)).w_full().flex_none()))
-            .child(
-                img("images/logo.png")
-                    .size(px(28.))
-                    .rounded(px(6.))
-                    .mb(px(12.)),
-            )
-            .child(
-                div()
-                    .relative()
-                    .child(
-                        icon_button("rail-chats", IconName::MessageCircle, 40., p.primary_ink, p)
-                            .bg(p.primary_tint),
-                    )
-                    .when(unread > 0, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .top(px(-4.))
-                                .right(px(-6.))
-                                .child(unread_badge(unread, p)),
-                        )
-                    }),
-            )
-            // Friends and add-friend stay hidden until the API supports them.
+            .child(drag_region(div().h(px(32.)).w_full().flex_none()))
+            .child(self.rail_item("rail-friends", IconName::User, Section::Friends, 0, cx, p))
+            .child(self.rail_item(
+                "rail-chats",
+                IconName::MessageCircle,
+                Section::Chats,
+                unread,
+                cx,
+                p,
+            ))
+            .child(self.rail_item("rail-people", IconName::UserPlus, Section::People, 0, cx, p))
             .child(div().flex_1())
             .child(
-                icon_button("rail-settings", IconName::Settings, 40., muted, p)
+                icon_button("rail-settings", IconName::Settings, 36., muted, p)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(ShellEvent::OpenSettings))),
             )
             // Your own avatar opens the account menu.
             .child(
                 div()
                     .id("rail-account")
-                    .size(px(40.))
+                    .size(px(36.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -144,12 +228,466 @@ impl ShellView {
                     .cursor_pointer()
                     .when(menu_open, |d| d.bg(active_bg))
                     .hover(move |s| s.bg(hover_bg))
-                    .child(avatar(photo, 32., p))
+                    .child(avatar(photo, 28., p))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.user_menu_open = !this.user_menu_open;
                         cx.notify();
                     })),
             )
+    }
+
+    fn rail_item(
+        &self,
+        id: &'static str,
+        name: IconName,
+        section: Section,
+        badge: i64,
+        cx: &mut Context<Self>,
+        p: &Palette,
+    ) -> impl IntoElement {
+        let active = self.section == section;
+        div()
+            .relative()
+            .child(
+                icon_button(
+                    id,
+                    name,
+                    36.,
+                    if active {
+                        p.primary_ink
+                    } else {
+                        p.ink_secondary
+                    },
+                    p,
+                )
+                .when(active, |d| d.bg(p.primary_tint))
+                .on_click(cx.listener(move |this, _, _, cx| this.show(section, cx))),
+            )
+            .when(badge > 0, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(-4.))
+                        .right(px(-6.))
+                        .child(unread_badge(badge, p)),
+                )
+            })
+    }
+
+    fn show(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        self.user_menu_open = false;
+        if section == Section::Friends {
+            self.store.update(cx, |s, cx| s.load_friends(false, cx));
+        }
+        cx.notify();
+    }
+
+    // ---- friends --------------------------------------------------------
+
+    fn render_friends(&self, cx: &mut Context<Self>, p: &Palette) -> AnyElement {
+        let q = self.friend_search.read(cx).value().trim().to_lowercase();
+        let store = self.store.read(cx);
+        let loading = store.friends_loading;
+        let total = store.friends.len();
+        let friends: Vec<UserProfile> = store
+            .friends
+            .iter()
+            .filter(|u| {
+                q.is_empty()
+                    || u.display_name().to_lowercase().contains(&q)
+                    || u.username.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect();
+        let hover = p.surface_muted;
+
+        let header = div()
+            .h(px(64.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .child(drag_region(div().flex_1()))
+            .child(
+                div()
+                    .h(px(36.))
+                    .px(px(16.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .border_b_1()
+                    .border_color(p.divider)
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(p.ink)
+                            .child("เพื่อน"),
+                    )
+                    .when(total > 0, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(p.ink_subtitle)
+                                .font_features(tnum())
+                                .child(total.to_string()),
+                        )
+                    }),
+            );
+
+        let body: AnyElement = if loading && total == 0 {
+            div()
+                .flex()
+                .flex_col()
+                .children((0..8).map(|i| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(16.))
+                        .py(px(10.))
+                        .child(Skeleton::new().size(px(40.)).rounded_full())
+                        .child(
+                            Skeleton::new()
+                                .h(px(12.))
+                                .w(px(if i % 2 == 0 { 140. } else { 100. }))
+                                .rounded(px(2.)),
+                        )
+                }))
+                .into_any_element()
+        } else if friends.is_empty() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .px(px(24.))
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.ink)
+                        .child(if q.is_empty() {
+                            "ยังไม่มีเพื่อน"
+                        } else {
+                            "ไม่พบเพื่อน"
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(p.ink_subtitle)
+                        .text_center()
+                        .child(if q.is_empty() {
+                            "คนที่คุณติดตามในแอป Pinto จะแสดงที่นี่".to_string()
+                        } else {
+                            format!("ไม่มีเพื่อนที่ตรงกับ “{q}”")
+                        }),
+                )
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = friends
+                .into_iter()
+                .map(|u| {
+                    let image = u
+                        .profile_image
+                        .clone()
+                        .and_then(|url| self.store.update(cx, |s, cx| s.image(&url, cx)));
+                    let friend = u.clone();
+                    div()
+                        .id(SharedString::from(format!("friend-{}", u.user_id)))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(16.))
+                        .py(px(10.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .child(avatar(image, 40., p))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(14.))
+                                        .line_height(px(20.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.ink)
+                                        .child(u.display_name().to_string()),
+                                )
+                                .when(!u.username.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .line_height(px(16.))
+                                            .text_color(p.ink_subtitle)
+                                            .child(format!("@{}", u.username)),
+                                    )
+                                }),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.section = Section::Chats;
+                            this.store.update(cx, |s, cx| s.open_direct(&friend, cx));
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            // The scrollbar sits on a fixed wrapper, not on the moving content.
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .id("friends-list")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.friends_scroll)
+                        .children(rows),
+                )
+                .vertical_scrollbar(&self.friends_scroll)
+                .into_any_element()
+        };
+
+        div()
+            .when(self.narrow, |d| d.flex_1().min_w_0())
+            .when(!self.narrow, |d| d.w(px(300.)).flex_none())
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(p.surface)
+            .border_r_1()
+            .border_color(p.divider)
+            .child(header)
+            .child(div().p(px(12.)).child(search_field(
+                &self.friend_search,
+                self.friend_focused,
+                p,
+            )))
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    // ---- find people ----------------------------------------------------
+
+    fn render_people(&self, cx: &mut Context<Self>, p: &Palette) -> AnyElement {
+        let store = self.store.read(cx);
+        let (query, loading) = (store.people_query.clone(), store.people_loading);
+        let people: Vec<UserProfile> = store.people.clone();
+        let hover = p.surface_muted;
+
+        let body: AnyElement = if query.is_empty() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .px(px(24.))
+                .gap(px(4.))
+                .child(
+                    div()
+                        .size(px(48.))
+                        .mb(px(8.))
+                        .rounded_full()
+                        .bg(p.primary_tint)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(IconName::UserPlus, 22., p.primary_ink)),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.ink)
+                        .child("ค้นหาคนหรือบอทในแอป Pinto"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(p.ink_subtitle)
+                        .text_center()
+                        .child("พิมพ์ชื่อหรือชื่อผู้ใช้ แล้วกดแชทเพื่อเริ่มคุยได้ทันที"),
+                )
+                .into_any_element()
+        } else if loading && people.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .children((0..6).map(|i| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(16.))
+                        .py(px(10.))
+                        .child(Skeleton::new().size(px(40.)).rounded_full())
+                        .child(
+                            Skeleton::new()
+                                .h(px(12.))
+                                .w(px(if i % 2 == 0 { 140. } else { 100. }))
+                                .rounded(px(2.)),
+                        )
+                }))
+                .into_any_element()
+        } else if people.is_empty() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .px(px(24.))
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(p.ink)
+                        .child("ไม่พบผู้ใช้"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(p.ink_subtitle)
+                        .text_center()
+                        .child(format!("ไม่มีใครตรงกับ “{query}”")),
+                )
+                .into_any_element()
+        } else {
+            let rows: Vec<AnyElement> = people
+                .into_iter()
+                .map(|u| {
+                    let image = u
+                        .profile_image
+                        .clone()
+                        .and_then(|url| self.store.update(cx, |s, cx| s.image(&url, cx)));
+                    let chat_with = u.clone();
+                    div()
+                        .id(SharedString::from(format!("person-{}", u.user_id)))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(16.))
+                        .py(px(10.))
+                        .hover(move |s| s.bg(hover))
+                        .child(avatar(image, 40., p))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(14.))
+                                                .line_height(px(20.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(p.ink)
+                                                .child(u.display_name().to_string()),
+                                        )
+                                        .when(u.is_official, |d| {
+                                            d.child(icon(IconName::BadgeCheck, 14., p.primary_ink))
+                                        }),
+                                )
+                                .when(!u.username.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .line_height(px(16.))
+                                            .text_color(p.ink_subtitle)
+                                            .child(format!("@{}", u.username)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div().flex().flex_none().gap(px(4.)).child(
+                                Button::new(SharedString::from(format!("chat-{}", u.user_id)))
+                                    .outline()
+                                    .small()
+                                    .label("แชท")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.section = Section::Chats;
+                                        this.store
+                                            .update(cx, |s, cx| s.open_direct(&chat_with, cx));
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            // The scrollbar sits on a fixed wrapper, not on the moving content.
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .id("people-list")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.people_scroll)
+                        .children(rows),
+                )
+                .vertical_scrollbar(&self.people_scroll)
+                .into_any_element()
+        };
+
+        div()
+            .when(self.narrow, |d| d.flex_1().min_w_0())
+            .when(!self.narrow, |d| d.w(px(300.)).flex_none())
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(p.surface)
+            .border_r_1()
+            .border_color(p.divider)
+            .child(
+                div()
+                    .h(px(64.))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .child(drag_region(div().flex_1()))
+                    .child(
+                        div()
+                            .h(px(36.))
+                            .px(px(16.))
+                            .flex()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(p.divider)
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.ink)
+                                    .child("เพิ่มเพื่อน"),
+                            ),
+                    ),
+            )
+            .child(div().p(px(12.)).child(search_field(
+                &self.people_search,
+                self.people_focused,
+                p,
+            )))
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 
     fn render_user_menu(&self, cx: &mut Context<Self>, p: &Palette) -> impl IntoElement {
@@ -511,7 +1049,7 @@ impl ShellView {
             cx.defer(move |cx| store.update(cx, |s, cx| s.load_chats(false, cx)));
         }
 
-        div()
+        let list = div()
             .id("chat-list")
             .size_full()
             .overflow_y_scroll()
@@ -534,15 +1072,21 @@ impl ShellView {
                         .text_color(p.ink_subtitle)
                         .child("กำลังโหลด"),
                 )
-            })
+            });
+        // The scrollbar sits on a fixed wrapper, not on the moving content.
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            .vertical_scrollbar(&self.list_scroll)
             .into_any_element()
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>, p: &Palette) -> impl IntoElement {
         div()
-            .w(px(300.))
+            .when(self.narrow, |d| d.flex_1().min_w_0())
+            .when(!self.narrow, |d| d.w(px(300.)).flex_none())
             .h_full()
-            .flex_none()
             .flex()
             .flex_col()
             .bg(p.surface)
@@ -558,20 +1102,44 @@ impl ShellView {
                     .child(self.render_tabs(cx, p)),
             )
             .child(
-                div().p(px(12.)).child(
-                    Input::new(&self.search)
-                        .prefix(icon(IconName::Search, 16., p.ink_subtitle))
-                        .cleanable(true)
-                        .small(),
-                ),
+                div()
+                    .p(px(12.))
+                    .child(search_field(&self.search, self.search_focused, p)),
             )
             .child(div().flex_1().min_h_0().child(self.render_list(cx, p)))
     }
 }
 
+/// Search box shared by the chat and friends lists: 36px, soft fill,
+/// 10px radius, a hairline that turns green while it has focus.
+fn search_field(state: &Entity<InputState>, focused: bool, p: &Palette) -> impl IntoElement {
+    div()
+        .h(px(36.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .rounded(px(10.))
+        .bg(if focused { p.surface } else { p.surface_muted })
+        .border_1()
+        .border_color(if focused { p.primary } else { p.hairline })
+        .child(icon(IconName::Search, 16., p.ink_subtitle))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(state).appearance(false).cleanable(true)),
+        )
+}
+
 impl Render for ShellView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        self.narrow = window.viewport_size().width < px(NARROW_W);
+        let chat_open = self.store.read(cx).selected_chat.is_some();
+        // Narrow: the list, or the open chat, never both.
+        let show_list = !self.narrow || !chat_open || self.section != Section::Chats;
+        let show_room = !self.narrow || (chat_open && self.section == Section::Chats);
         div()
             .size_full()
             .relative()
@@ -579,8 +1147,16 @@ impl Render for ShellView {
             .bg(p.background)
             .text_color(p.ink)
             .child(self.render_rail(cx, &p))
-            .child(self.render_sidebar(cx, &p))
-            .child(div().flex_1().min_w_0().h_full().child(self.room.clone()))
+            .when(show_list, |d| {
+                d.child(match self.section {
+                    Section::Chats => self.render_sidebar(cx, &p).into_any_element(),
+                    Section::Friends => self.render_friends(cx, &p),
+                    Section::People => self.render_people(cx, &p),
+                })
+            })
+            .when(show_room, |d| {
+                d.child(div().flex_1().min_w_0().h_full().child(self.room.clone()))
+            })
             .when(self.user_menu_open, |d| {
                 d.child(self.render_user_menu(cx, &p))
             })

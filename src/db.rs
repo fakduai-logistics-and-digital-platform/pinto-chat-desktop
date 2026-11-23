@@ -546,6 +546,20 @@ mod tests {
     }
 
     #[test]
+    fn finds_direct_chat_by_participant() {
+        let chat = Chat::from_value(&json!({
+            "chat_id": "c9", "chat_type": "direct",
+            "participants": [{"user_id": "me"}, {"user_id": "u-ploy", "name": "Ploy"}]
+        }))
+        .unwrap();
+        assert!(chat.is_direct_with("u-ploy"));
+        assert_eq!(chat.partner_id("me").as_deref(), Some("u-ploy"));
+        assert!(!chat.is_direct_with("u-other"));
+        let group = Chat::from_value(&json!({"chat_id": "g1", "chat_type": "group", "participants": [{"user_id": "u-ploy"}]})).unwrap();
+        assert!(!group.is_direct_with("u-ploy"));
+    }
+
+    #[test]
     fn meta_and_mute() {
         let db = Db::in_memory().unwrap();
         db.meta_set("pin:c1", Some("m9")).unwrap();

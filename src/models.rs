@@ -68,6 +68,9 @@ pub struct UserProfile {
     pub name: String,
     #[serde(default)]
     pub profile_image: Option<String>,
+    /// Official (verified) account, from user search.
+    #[serde(default)]
+    pub is_official: bool,
 }
 
 impl UserProfile {
@@ -79,6 +82,7 @@ impl UserProfile {
             username,
             user_id,
             profile_image: s(v, "profile_image"),
+            is_official: b(v, "is_official"),
         })
     }
 
@@ -183,6 +187,31 @@ impl Chat {
 
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or("ไม่ทราบชื่อ")
+    }
+
+    /// The other person in a one-to-one chat, from the stored participants.
+    pub fn partner_id(&self, me: &str) -> Option<String> {
+        if self.chat_type != ChatType::Direct {
+            return None;
+        }
+        let v: Value = serde_json::from_str(&self.raw_json).ok()?;
+        v.get("participants")?
+            .as_array()?
+            .iter()
+            .filter_map(|p| s(p, "user_id"))
+            .find(|id| id != me)
+    }
+
+    /// Whether this is a one-to-one chat with `user_id`, from the stored participants.
+    pub fn is_direct_with(&self, user_id: &str) -> bool {
+        self.chat_type == ChatType::Direct
+            && serde_json::from_str::<Value>(&self.raw_json)
+                .ok()
+                .and_then(|v| v.get("participants")?.as_array().cloned())
+                .is_some_and(|ps| {
+                    ps.iter()
+                        .any(|p| s(p, "user_id").as_deref() == Some(user_id))
+                })
     }
 
     pub fn sort_time(&self) -> DateTime<Utc> {

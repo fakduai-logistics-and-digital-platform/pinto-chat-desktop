@@ -164,6 +164,8 @@ pub fn apply(dark: bool, window: Option<&mut Window>, cx: &mut App) {
     theme.radius = px(8.);
     theme.radius_lg = px(12.);
     theme.shadow = !dark;
+    // Keep the scrollbar visible whenever a list has more rows than fit.
+    theme.scrollbar_mode = gpui_kit::component::scroll::ScrollbarMode::Always;
 
     let c = &mut theme.colors;
     c.background = p.surface;

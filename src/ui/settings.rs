@@ -143,7 +143,7 @@ impl Render for SettingsView {
             .flex_col()
             .bg(p.background)
             // Strip for the window controls; it also drags the window.
-            .child(drag_region(div().h(px(40.)).w_full().flex_none()))
+            .child(drag_region(div().h(px(32.)).w_full().flex_none()))
             .child(
                 div()
                     .id("settings-scroll")

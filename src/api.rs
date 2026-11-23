@@ -366,6 +366,63 @@ impl Api {
         })
     }
 
+    /// People the signed-in user follows (`GET /v1/follow/following`).
+    pub fn following(&self, page: usize, page_size: usize) -> ApiResult<(Vec<UserProfile>, usize)> {
+        let v = self.request(
+            "GET",
+            &format!("/v1/follow/following?page={page}&pageSize={page_size}"),
+            Body::Empty,
+        )?;
+        let list = v
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let pages = v.get("totalPages").and_then(Value::as_u64).unwrap_or(1) as usize;
+        Ok((
+            list.iter().filter_map(UserProfile::from_value).collect(),
+            pages,
+        ))
+    }
+
+    /// People by name or username (`GET /v1/search/username/{q}`, up to 60).
+    pub fn search_users(&self, query: &str) -> ApiResult<Vec<UserProfile>> {
+        let v = self.request(
+            "GET",
+            &format!(
+                "/v1/search/username/{}?page=1&pageSize=60",
+                urlencoding::encode(query)
+            ),
+            Body::Empty,
+        )?;
+        let list = v
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(list.iter().filter_map(UserProfile::from_value).collect())
+    }
+
+    /// Profile by id (`GET /v1/users/{user_id}`), for chats that came without a name.
+    pub fn user(&self, user_id: &str) -> ApiResult<Option<UserProfile>> {
+        let v = self.request("GET", &format!("/v1/users/{user_id}"), Body::Empty)?;
+        let one = v.as_array().and_then(|a| a.first().cloned()).unwrap_or(v);
+        Ok(UserProfile::from_value(&one).filter(|u| !u.name.is_empty() || !u.username.is_empty()))
+    }
+
+    /// `POST /v1/chats` for a one-to-one chat; the backend adds us itself.
+    pub fn create_direct_chat(&self, user_id: &str) -> ApiResult<Chat> {
+        let v = self.request(
+            "POST",
+            "/v1/chats",
+            Body::Json(json!({ "chat_type": "direct", "participants": [user_id] })),
+        )?;
+        let chat = v.get("chat").unwrap_or(&v);
+        Chat::from_value(chat).ok_or_else(|| invalid("สร้างแชทไม่สำเร็จ"))
+    }
+
     pub fn send_typing(&self, chat_id: &str) -> ApiResult<()> {
         self.request(
             "POST",

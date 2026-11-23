@@ -79,6 +79,18 @@ pub struct Store {
     pub chats_loading: bool,
     pub chats_loading_more: bool,
     pub chats_has_more: bool,
+    /// People you follow, loaded when the friends list is first opened.
+    pub friends: Vec<UserProfile>,
+    pub friends_loading: bool,
+    /// Results of the find-people search.
+    pub people: Vec<UserProfile>,
+    pub people_query: String,
+    pub people_loading: bool,
+    people_epoch: u64,
+    friends_loaded: bool,
+    opening_direct: bool,
+    /// Partner ids already looked up for unnamed chats, so each is fetched once.
+    resolved_partners: HashSet<String>,
     typing: HashSet<String>,
     typing_epoch: HashMap<String, u64>,
 
@@ -140,6 +152,15 @@ impl Store {
             chats_loading: false,
             chats_loading_more: false,
             chats_has_more: true,
+            friends: Vec::new(),
+            friends_loading: false,
+            people: Vec::new(),
+            people_query: String::new(),
+            people_loading: false,
+            people_epoch: 0,
+            friends_loaded: false,
+            opening_direct: false,
+            resolved_partners: HashSet::new(),
             typing: HashSet::new(),
             typing_epoch: HashMap::new(),
             messages: HashMap::new(),
@@ -289,6 +310,7 @@ impl Store {
             username: "nattapong.k".into(),
             name: "ณัฐพงษ์ แก้วมณี".into(),
             profile_image: None,
+            is_official: false,
         });
         self.phase = Phase::SignedIn;
         self.connection = ConnectionState::Connected;
@@ -410,6 +432,40 @@ impl Store {
         msgs.insert(1, file);
         self.messages.insert("c1".into(), msgs);
         self.pinned.insert("c1".into(), Some("m3".into()));
+        self.friends = [
+            ("u-ploy", "ploy.s", "พลอยไพลิน ศรีสุข"),
+            ("u-kamol", "kamonwan.j", "กมลวรรณ ใจดี"),
+            ("u-somchai", "somchai.p", "Somchai P."),
+            ("u-anucha", "anucha.w", "อนุชา วงศ์ใหญ่"),
+            ("u-dao", "dao.r", "ดาวเรือง ทองดี"),
+            ("u-mek", "mek.t", "เมฆ ธนากร"),
+        ]
+        .into_iter()
+        .map(|(id, user, name)| UserProfile {
+            user_id: id.into(),
+            username: user.into(),
+            name: name.into(),
+            profile_image: None,
+            is_official: false,
+        })
+        .collect();
+        self.friends_loaded = true;
+        self.people_query = "pinto".into();
+        self.people = [
+            ("b-assist", "pinto.assistant", "Pinto Assistant", true),
+            ("b-ship", "pinto.shipping", "Pinto ขนส่ง", true),
+            ("u-ploy", "ploy.s", "พลอยไพลิน ศรีสุข", false),
+            ("u-pin", "pinnapa.k", "ปิ่นนภา คงสุข", false),
+        ]
+        .into_iter()
+        .map(|(id, user, name, official)| UserProfile {
+            user_id: id.into(),
+            username: user.into(),
+            name: name.into(),
+            profile_image: None,
+            is_official: official,
+        })
+        .collect();
         if let Some(c) = self.chats.get_mut("c3") {
             c.is_muted = true;
         }
@@ -493,19 +549,37 @@ impl Store {
                 this.chats_loading_more = false;
                 match result {
                     Ok(page) => {
+                        // Keep a name/avatar looked up earlier when the server
+                        // still sends this chat without one.
+                        let chats: Vec<Chat> = page
+                            .chats
+                            .into_iter()
+                            .map(|mut c| {
+                                if let Some(old) = this.chats.get(&c.chat_id) {
+                                    if c.name.is_none() {
+                                        c.name = old.name.clone();
+                                    }
+                                    if c.avatar_url.is_none() {
+                                        c.avatar_url = old.avatar_url.clone();
+                                    }
+                                }
+                                c
+                            })
+                            .collect();
                         if let Some(db) = this.db()
-                            && let Err(e) = db.upsert_chats(&page.chats)
+                            && let Err(e) = db.upsert_chats(&chats)
                         {
                             log::warn!("cache chats: {e:#}");
                         }
                         if reset && (!this.search.is_empty() || this.filter.is_some()) {
                             this.chats.clear();
                         }
-                        this.chats_has_more = page.chats.len() == CHAT_PAGE_SIZE;
-                        for c in page.chats {
+                        this.chats_has_more = chats.len() == CHAT_PAGE_SIZE;
+                        for c in chats {
                             this.chats.insert(c.chat_id.clone(), c);
                         }
                         this.chat_page += 1;
+                        this.resolve_unnamed_chats(cx);
                     }
                     Err(e) => log::warn!("load chats: {e}"),
                 }
@@ -595,6 +669,189 @@ impl Store {
             self.mark_read(&id, cx);
         }
         cx.notify();
+    }
+
+    /// Some direct chats arrive with an empty participant name. Look the
+    /// partner up by id once, then keep the name and avatar in SQLite.
+    fn resolve_unnamed_chats(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.user.as_ref().map(|u| u.user_id.clone()) else {
+            return;
+        };
+        let todo: Vec<(String, String)> = self
+            .chats
+            .values()
+            .filter(|c| c.name.is_none())
+            .filter_map(|c| Some((c.chat_id.clone(), c.partner_id(&me)?)))
+            .filter(|(_, partner)| !self.resolved_partners.contains(partner))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        for (_, partner) in &todo {
+            self.resolved_partners.insert(partner.clone());
+        }
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            for (chat_id, partner) in todo {
+                let api = api.clone();
+                let found = cx.background_spawn(async move { api.user(&partner) }).await;
+                let Ok(Some(user)) = found else { continue };
+                let keep = this.update(cx, |this, cx| {
+                    if let Some(chat) = this.chats.get_mut(&chat_id) {
+                        chat.name = Some(user.display_name().to_string());
+                        if chat.avatar_url.is_none() {
+                            chat.avatar_url = user.profile_image.clone();
+                        }
+                        let updated = chat.clone();
+                        if let Some(db) = this.db() {
+                            let _ = db.upsert_chats(std::slice::from_ref(&updated));
+                        }
+                        cx.notify();
+                    }
+                });
+                if keep.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ---- friends --------------------------------------------------------
+
+    /// Loads the following list once (all pages, capped at 1,000 people).
+    pub fn load_friends(&mut self, force: bool, cx: &mut Context<Self>) {
+        if self.friends_loading || (self.friends_loaded && !force) {
+            return;
+        }
+        self.friends_loading = true;
+        cx.notify();
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut all = Vec::new();
+                    let mut page = 1;
+                    loop {
+                        let (list, pages) = api.following(page, 100)?;
+                        let done = list.is_empty() || page >= pages || all.len() >= 1000;
+                        all.extend(list);
+                        if done {
+                            break;
+                        }
+                        page += 1;
+                    }
+                    Ok::<_, ApiError>(all)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.friends_loading = false;
+                match result {
+                    Ok(mut list) => {
+                        list.sort_by_key(|u| u.display_name().to_lowercase());
+                        this.friends = list;
+                        this.friends_loaded = true;
+                    }
+                    Err(e) => cx.emit(StoreEvent::Toast(
+                        format!("โหลดรายชื่อเพื่อนไม่สำเร็จ: {e}").into(),
+                    )),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Searches people by name or username (debounced by the view).
+    pub fn search_people(&mut self, query: String, cx: &mut Context<Self>) {
+        self.people_epoch += 1;
+        let epoch = self.people_epoch;
+        self.people_query = query.clone();
+        if query.is_empty() {
+            self.people.clear();
+            self.people_loading = false;
+            cx.notify();
+            return;
+        }
+        self.people_loading = true;
+        cx.notify();
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { api.search_users(&query) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.people_epoch != epoch {
+                    return;
+                }
+                this.people_loading = false;
+                match result {
+                    Ok(list) => {
+                        let me = this.user.as_ref().map(|u| u.user_id.clone());
+                        this.people = list
+                            .into_iter()
+                            .filter(|u| Some(&u.user_id) != me.as_ref())
+                            .collect();
+                    }
+                    Err(e) => {
+                        this.people.clear();
+                        cx.emit(StoreEvent::Toast(format!("ค้นหาไม่สำเร็จ: {e}").into()));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens the one-to-one chat with a friend, creating it on the server
+    /// only when no such chat is known locally.
+    pub fn open_direct(&mut self, friend: &UserProfile, cx: &mut Context<Self>) {
+        if let Some(id) = self
+            .chats
+            .values()
+            .find(|c| c.is_direct_with(&friend.user_id))
+            .map(|c| c.chat_id.clone())
+        {
+            self.select_chat(Some(id), cx);
+            return;
+        }
+        if self.opening_direct {
+            return;
+        }
+        self.opening_direct = true;
+        let api = self.api.clone();
+        let user_id = friend.user_id.clone();
+        let fallback_name = friend.display_name().to_string();
+        let fallback_avatar = friend.profile_image.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { api.create_direct_chat(&user_id) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.opening_direct = false;
+                match result {
+                    Ok(mut chat) => {
+                        chat.name.get_or_insert(fallback_name);
+                        if chat.avatar_url.is_none() {
+                            chat.avatar_url = fallback_avatar;
+                        }
+                        if let Some(db) = this.db() {
+                            let _ = db.upsert_chats(std::slice::from_ref(&chat));
+                        }
+                        let id = chat.chat_id.clone();
+                        this.chats.insert(id.clone(), chat);
+                        this.select_chat(Some(id), cx);
+                    }
+                    Err(e) => cx.emit(StoreEvent::Toast(format!("เปิดแชทไม่สำเร็จ: {e}").into())),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- local-only chat features --------------------------------------

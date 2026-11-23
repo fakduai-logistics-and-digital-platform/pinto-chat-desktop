@@ -764,7 +764,7 @@ impl RoomView {
             )
     }
 
-    fn render_header(&self, cx: &mut Context<Self>, p: &Palette) -> impl IntoElement {
+    fn render_header(&self, narrow: bool, cx: &mut Context<Self>, p: &Palette) -> impl IntoElement {
         let store = self.store.read(cx);
         let chat = store.selected().cloned();
         let connection = store.connection;
@@ -802,6 +802,14 @@ impl RoomView {
             .bg(p.surface)
             .border_b_1()
             .border_color(p.divider)
+            .when(narrow, |d| {
+                d.child(
+                    icon_button("room-back", IconName::ChevronLeft, 32., p.ink_secondary, p)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.store.update(cx, |s, cx| s.select_chat(None, cx))
+                        })),
+                )
+            })
             .child(avatar(image, 40., p))
             .child(
                 drag_region(div())
@@ -1472,6 +1480,7 @@ impl RoomView {
 impl Render for RoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
+        let narrow = window.viewport_size().width < px(super::shell::NARROW_W);
         if self.store.read(cx).selected_chat.is_none() {
             return self.render_empty(&p).into_any_element();
         }
@@ -1567,7 +1576,7 @@ impl Render for RoomView {
             .flex()
             .flex_col()
             .bg(p.background)
-            .child(self.render_header(cx, &p))
+            .child(self.render_header(narrow, cx, &p))
             .children(pinned)
             .child(
                 div()
