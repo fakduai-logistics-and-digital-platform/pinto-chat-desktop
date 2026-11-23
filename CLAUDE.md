@@ -81,7 +81,7 @@ assets/
 ## Key Implementation Details
 
 ### Environment
-`env::Env::load()` reads `.env` then the process env. Names: `PINTO_API_BASE_URL`, `PINTO_WS_URL`, `PINTO_QR_AUTH_WS_URL` (old `VITE_PINTO_*` names are still accepted). WS and QR URLs are derived from the API URL when unset.
+`env::Env::load()` reads `.env` then the process env. Names: `PINTO_API_BASE_URL`, `PINTO_WS_URL`, `PINTO_QR_AUTH_WS_URL` (old `VITE_PINTO_*` names are still accepted). WS and QR URLs are derived from the API URL when unset. With nothing set, the API defaults to dev, or to `PINTO_BUILD_API_BASE_URL` read at compile time (CI sets it to `https://api.pinto-app.com`, so built apps use production).
 
 ### Data location
 `~/Library/Application Support/com.pinto.chat-desktop/` (same identifier as the old Tauri build, so existing `pinto-chat.sqlite` opens as is): `pinto-chat.sqlite`, `session.json` (tokens), `settings.json`.

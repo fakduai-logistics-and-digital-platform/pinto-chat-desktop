@@ -17,6 +17,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Built apps talk to production. Local `cargo run` keeps the dev API, and a
+  # PINTO_API_BASE_URL in the environment or .env still overrides this.
+  PINTO_BUILD_API_BASE_URL: https://api.pinto-app.com
   # Only main writes the cache; PRs and tags restore main's cache read-only,
   # so the repository's 10 GB cache budget isn't spent on one-off branches.
   SAVE_CACHE: ${{ github.ref == 'refs/heads/main' }}

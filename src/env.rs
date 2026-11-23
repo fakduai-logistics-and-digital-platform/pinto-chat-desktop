@@ -18,7 +18,13 @@ pub const WS_RECONNECT_DELAYS_MS: [u64; 5] = [1000, 2000, 5000, 10000, 30000];
 pub const QR_RECONNECT_DELAY_MS: u64 = 3000;
 pub const QR_MAX_LIFETIME_SECS: u64 = 60;
 
-const DEFAULT_API: &str = "https://api-dev.pinto-app.com";
+/// API used when neither the environment nor `.env` names one. Release builds
+/// in CI set `PINTO_BUILD_API_BASE_URL` at compile time to point at production;
+/// local builds fall back to the dev API.
+const DEFAULT_API: &str = match option_env!("PINTO_BUILD_API_BASE_URL") {
+    Some(url) => url,
+    None => "https://api-dev.pinto-app.com",
+};
 
 #[derive(Clone, Debug)]
 pub struct Env {
