@@ -412,6 +412,17 @@ impl Api {
         Ok(UserProfile::from_value(&one).filter(|u| !u.name.is_empty() || !u.username.is_empty()))
     }
 
+    /// `GET /v1/chats/{chat_id}`
+    pub fn chat_detail(&self, chat_id: &str) -> ApiResult<Chat> {
+        let v = self.request(
+            "GET",
+            &format!("/v1/chats/{}", urlencoding::encode(chat_id)),
+            Body::Empty,
+        )?;
+        let chat = v.get("chat").unwrap_or(&v);
+        Chat::from_value(chat).ok_or_else(|| invalid("โหลดข้อมูลแชทไม่สำเร็จ"))
+    }
+
     /// `POST /v1/chats` for a one-to-one chat; the backend adds us itself.
     pub fn create_direct_chat(&self, user_id: &str) -> ApiResult<Chat> {
         let v = self.request(
@@ -432,10 +443,182 @@ impl Api {
         .map(|_| ())
     }
 
-    #[allow(dead_code)]
     pub fn delete_chat(&self, chat_id: &str) -> ApiResult<()> {
         self.request("DELETE", &format!("/v1/chats/{chat_id}"), Body::Empty)
             .map(|_| ())
+    }
+
+    /// `PUT /v1/chats/{chat_id}/notifications`
+    pub fn set_chat_mute(
+        &self,
+        chat_id: &str,
+        is_muted: bool,
+        duration_minutes: u32,
+    ) -> ApiResult<()> {
+        self.request(
+            "PUT",
+            &format!("/v1/chats/{}/notifications", urlencoding::encode(chat_id)),
+            Body::Json(json!({
+                "is_muted": is_muted,
+                "mute_duration_minutes": duration_minutes,
+            })),
+        )
+        .map(|_| ())
+    }
+
+    /// `PUT /v1/chats/{chat_id}`
+    pub fn rename_group(&self, chat_id: &str, name: &str) -> ApiResult<Chat> {
+        let data = self.request(
+            "PUT",
+            &format!("/v1/chats/{}", urlencoding::encode(chat_id)),
+            Body::Json(json!({ "name": name })),
+        )?;
+        let raw = data.get("chat").unwrap_or(&data);
+        Chat::from_value(raw).ok_or_else(|| invalid("ข้อมูลกลุ่มไม่ถูกต้อง"))
+    }
+
+    /// `PUT /v1/chats/{chat_id}/avatar`
+    pub fn update_group_avatar(&self, chat_id: &str, file: &Path) -> ApiResult<Chat> {
+        let bytes = std::fs::read(file).map_err(|e| invalid(&format!("อ่านไฟล์ไม่ได้: {e}")))?;
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("avatar.png")
+            .to_string();
+        let mime = mime_for(&name);
+        let form = Form::new().file("avatar", &name, mime, &bytes).finish();
+        let data = self.request(
+            "PUT",
+            &format!("/v1/chats/{}/avatar", urlencoding::encode(chat_id)),
+            form,
+        )?;
+        let raw = data.get("chat").unwrap_or(&data);
+        Chat::from_value(raw).ok_or_else(|| invalid("ข้อมูลกลุ่มไม่ถูกต้อง"))
+    }
+
+    /// `POST /v1/chats/{chat_id}/invites`
+    pub fn get_group_invite(&self, chat_id: &str) -> ApiResult<String> {
+        let data = self.request(
+            "POST",
+            &format!("/v1/chats/{}/invites", urlencoding::encode(chat_id)),
+            Body::Empty,
+        )?;
+        data.get("invite_url")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                data.get("invite_token")
+                    .and_then(Value::as_str)
+                    .map(|t| format!("pinto://group-chat/invite?token={t}"))
+            })
+            .ok_or_else(|| invalid("ไม่พบลิงก์เชิญกลุ่ม"))
+    }
+
+    /// `POST /v1/chats/{chat_id}/participants` (admin/owner only)
+    pub fn add_group_participants(&self, chat_id: &str, user_ids: &[String]) -> ApiResult<()> {
+        self.request(
+            "POST",
+            &format!("/v1/chats/{}/participants", urlencoding::encode(chat_id)),
+            Body::Json(json!({ "participants": user_ids })),
+        )
+        .map(|_| ())
+    }
+
+    /// `DELETE /v1/chats/{chat_id}/participants/{user_id}`
+    pub fn remove_group_participant(&self, chat_id: &str, user_id: &str) -> ApiResult<()> {
+        self.request(
+            "DELETE",
+            &format!(
+                "/v1/chats/{}/participants/{}",
+                urlencoding::encode(chat_id),
+                urlencoding::encode(user_id)
+            ),
+            Body::Empty,
+        )
+        .map(|_| ())
+    }
+
+    /// `PUT /v1/chats/{chat_id}/roles` (owner only)
+    pub fn update_participant_role(
+        &self,
+        chat_id: &str,
+        user_id: &str,
+        role: &str,
+    ) -> ApiResult<()> {
+        self.request(
+            "PUT",
+            &format!("/v1/chats/{}/roles", urlencoding::encode(chat_id)),
+            Body::Json(json!({ "user_id": user_id, "role": role })),
+        )
+        .map(|_| ())
+    }
+
+    /// `POST /v1/chats/{chat_id}/transfer-ownership` (owner only)
+    pub fn transfer_group_ownership(&self, chat_id: &str, new_owner_id: &str) -> ApiResult<()> {
+        self.request(
+            "POST",
+            &format!(
+                "/v1/chats/{}/transfer-ownership",
+                urlencoding::encode(chat_id)
+            ),
+            Body::Json(json!({ "new_owner_id": new_owner_id })),
+        )
+        .map(|_| ())
+    }
+
+    // ---- blocks ---------------------------------------------------------
+
+    /// `POST /v1/block/{user_id}`
+    pub fn block_user(&self, user_id: &str) -> ApiResult<()> {
+        self.request(
+            "POST",
+            &format!("/v1/block/{}", urlencoding::encode(user_id)),
+            Body::Empty,
+        )
+        .map(|_| ())
+    }
+
+    /// `DELETE /v1/block/{user_id}`
+    pub fn unblock_user(&self, user_id: &str) -> ApiResult<()> {
+        self.request(
+            "DELETE",
+            &format!("/v1/block/{}", urlencoding::encode(user_id)),
+            Body::Empty,
+        )
+        .map(|_| ())
+    }
+
+    /// `GET /v1/block/blocked?page=...&pageSize=...`
+    pub fn blocked_users(
+        &self,
+        page: usize,
+        page_size: usize,
+    ) -> ApiResult<(Vec<UserProfile>, usize)> {
+        let v = self.request(
+            "GET",
+            &format!("/v1/block/blocked?page={page}&pageSize={page_size}"),
+            Body::Empty,
+        )?;
+        let rows = v
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(UserProfile::from_value).collect())
+            .unwrap_or_default();
+        let pages = v.get("totalPages").and_then(Value::as_u64).unwrap_or(1) as usize;
+        Ok((rows, pages))
+    }
+
+    /// `GET /v1/block/{user_id}/status`
+    #[allow(dead_code)]
+    pub fn block_status(&self, user_id: &str) -> ApiResult<bool> {
+        let v = self.request(
+            "GET",
+            &format!("/v1/block/{}/status", urlencoding::encode(user_id)),
+            Body::Empty,
+        )?;
+        Ok(v.get("is_blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     // ---- messages -------------------------------------------------------

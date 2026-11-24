@@ -155,6 +155,53 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_chat_pinned(&self, chat_id: &str, pinned: bool) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE chats SET is_pinned = ?, updated_at = ? WHERE chat_id = ?",
+                params![pinned as i64, now_iso(), chat_id],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE chats SET is_archived = ?, updated_at = ? WHERE chat_id = ?",
+                params![archived as i64, now_iso(), chat_id],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn clear_chat_history(&self, chat_id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM messages WHERE chat_id = ?", params![chat_id])?;
+            c.execute(
+                "DELETE FROM pending_outbox WHERE chat_id = ?",
+                params![chat_id],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn delete_chat(&self, chat_id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM messages WHERE chat_id = ?", params![chat_id])?;
+            c.execute(
+                "DELETE FROM pending_outbox WHERE chat_id = ?",
+                params![chat_id],
+            )?;
+            c.execute(
+                "DELETE FROM chat_participants WHERE chat_id = ?",
+                params![chat_id],
+            )?;
+            c.execute("DELETE FROM chats WHERE chat_id = ?", params![chat_id])
+        })?;
+        Ok(())
+    }
+
     // ---- messages -------------------------------------------------------
 
     pub fn upsert_message(&self, m: &Message) -> Result<()> {
@@ -570,6 +617,27 @@ mod tests {
         db.upsert_chats(&[chat]).unwrap();
         db.set_chat_muted("c1", true).unwrap();
         assert!(db.all_chats().unwrap()[0].is_muted);
+        db.set_chat_pinned("c1", true).unwrap();
+        assert!(db.all_chats().unwrap()[0].is_pinned);
+        db.set_chat_archived("c1", true).unwrap();
+        assert!(db.all_chats().unwrap()[0].is_archived);
+    }
+
+    #[test]
+    fn clear_history_and_delete_chat() {
+        let db = Db::in_memory().unwrap();
+        let chat = Chat::from_value(&json!({"chat_id": "c1", "chat_type": "direct"})).unwrap();
+        db.upsert_chats(&[chat]).unwrap();
+        let m = Message::temp("c1", "u1", "hi", MessageType::Text, None);
+        db.upsert_message(&m).unwrap();
+        assert_eq!(db.messages("c1", 10, None).unwrap().len(), 1);
+
+        db.clear_chat_history("c1").unwrap();
+        assert!(db.messages("c1", 10, None).unwrap().is_empty());
+        assert_eq!(db.all_chats().unwrap().len(), 1);
+
+        db.delete_chat("c1").unwrap();
+        assert!(db.all_chats().unwrap().is_empty());
     }
 
     #[test]

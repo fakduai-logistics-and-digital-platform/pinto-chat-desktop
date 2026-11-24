@@ -140,6 +140,17 @@ pub struct Chat {
     pub raw_json: String,
 }
 
+/// Group/chat participant parsed from `Chat.raw_json` or `GET /v1/chats/{chat_id}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatParticipant {
+    pub user_id: String,
+    pub name: String,
+    pub username: String,
+    pub avatar_url: Option<String>,
+    pub role: String,
+    pub is_official: bool,
+}
+
 impl Chat {
     /// `normalizeChat`: fills name, avatar and last-message fields from the
     /// nested shapes the API may return.
@@ -200,6 +211,84 @@ impl Chat {
             .iter()
             .filter_map(|p| s(p, "user_id"))
             .find(|id| id != me)
+    }
+
+    /// Whether the other participant in a direct chat is verified (`is_official`).
+    pub fn partner_is_official(&self, me: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<Value>(&self.raw_json) else {
+            return false;
+        };
+        if let Some(ps) = v.get("participants").and_then(Value::as_array)
+            && let Some(p) = ps
+                .iter()
+                .find(|p| s(p, "user_id").as_deref() != Some(me))
+                .or_else(|| ps.first())
+        {
+            return b(p, "is_official") || b(p, "is_verified");
+        }
+        b(&v, "is_official") || b(&v, "is_verified")
+    }
+
+    /// Whether the other participant in a direct chat is a bot (`is_bot`).
+    pub fn partner_is_bot(&self, me: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<Value>(&self.raw_json) else {
+            return false;
+        };
+        if self.chat_type != ChatType::Direct {
+            return b(&v, "is_bot");
+        }
+        if let Some(ps) = v.get("participants").and_then(Value::as_array)
+            && let Some(p) = ps
+                .iter()
+                .find(|p| s(p, "user_id").as_deref() != Some(me))
+                .or_else(|| ps.first())
+        {
+            return b(p, "is_bot");
+        }
+        b(&v, "is_bot")
+    }
+
+    /// All participants in this chat, sorted owner -> admin -> member.
+    pub fn participants(&self) -> Vec<ChatParticipant> {
+        let Ok(v) = serde_json::from_str::<Value>(&self.raw_json) else {
+            return Vec::new();
+        };
+        let Some(ps) = v.get("participants").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ChatParticipant> = ps
+            .iter()
+            .filter_map(|p| {
+                let user_id = s(p, "user_id").or_else(|| s(p, "id"))?;
+                let username = s(p, "username").unwrap_or_default();
+                let name = s(p, "name").unwrap_or_else(|| {
+                    if username.is_empty() {
+                        user_id.clone()
+                    } else {
+                        username.clone()
+                    }
+                });
+                let avatar_url = s(p, "avatar")
+                    .or_else(|| s(p, "profile_image"))
+                    .or_else(|| path(p, &["use_avatar", "avatar_url"]));
+                let role = s(p, "role").unwrap_or_else(|| "member".into());
+                let is_official = b(p, "is_official") || b(p, "is_verified");
+                Some(ChatParticipant {
+                    user_id,
+                    name,
+                    username,
+                    avatar_url,
+                    role,
+                    is_official,
+                })
+            })
+            .collect();
+        out.sort_by_key(|p| match p.role.as_str() {
+            "owner" => 0,
+            "admin" => 1,
+            _ => 2,
+        });
+        out
     }
 
     /// Whether this is a one-to-one chat with `user_id`, from the stored participants.
@@ -445,4 +534,50 @@ pub struct ReplyTarget {
     pub message_id: String,
     pub sender_name: String,
     pub content: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Chat, ChatType};
+
+    fn make_chat(chat_type: ChatType, raw_json: &str) -> Chat {
+        Chat {
+            chat_id: "c1".into(),
+            chat_type,
+            name: None,
+            avatar_url: None,
+            last_message_id: None,
+            last_message_preview: None,
+            last_message_at: None,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+            is_archived: false,
+            is_deleted: false,
+            created_at: None,
+            updated_at: String::new(),
+            raw_json: raw_json.into(),
+        }
+    }
+
+    #[test]
+    fn partner_is_bot_detects_direct_bot_only() {
+        let direct_bot = make_chat(
+            ChatType::Direct,
+            r#"{"participants":[{"user_id":"me","is_bot":false},{"user_id":"b1","is_bot":true}]}"#,
+        );
+        assert!(direct_bot.partner_is_bot("me"));
+
+        let direct_human = make_chat(
+            ChatType::Direct,
+            r#"{"participants":[{"user_id":"me","is_bot":false},{"user_id":"u2","is_bot":false}]}"#,
+        );
+        assert!(!direct_human.partner_is_bot("me"));
+
+        let group_with_bot = make_chat(
+            ChatType::Group,
+            r#"{"participants":[{"user_id":"b1","is_bot":true},{"user_id":"me","is_bot":false}]}"#,
+        );
+        assert!(!group_with_bot.partner_is_bot("me"));
+    }
 }

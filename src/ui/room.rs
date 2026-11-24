@@ -10,6 +10,7 @@ use gpui_kit::component::{
     dialog::DialogButtonProps,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+    scroll::ScrollableElement,
     skeleton::Skeleton,
 };
 use gpui_kit::prelude::*;
@@ -19,12 +20,17 @@ use std::sync::Arc;
 use crate::{
     env::{MAX_MESSAGE_LENGTH, TYPING_DEBOUNCE_MS},
     format,
-    models::{ChatType, Message, MessageStatus, MessageType, ReplyTarget},
+    models::{
+        ChatParticipant, ChatType, Message, MessageStatus, MessageType, ReplyTarget, UserProfile,
+    },
     persist::Wallpaper,
     realtime::ConnectionState,
     store::{Store, StoreEvent},
     theme::{Palette, PaletteExt},
-    ui::widgets::{ICON, avatar, drag_region, icon, icon_button, tnum},
+    ui::emoji::{
+        EmojiCategory, EmojiPanelCallbacks, EmojiPrefs, record_recent, render_emoji_panel,
+    },
+    ui::widgets::{ICON, avatar, drag_region, icon, icon_button, tnum, verified_badge},
 };
 
 /// Tabs of the side panel listing what a chat has shared.
@@ -33,6 +39,7 @@ enum MediaTab {
     Images,
     Files,
     Links,
+    Members,
 }
 
 impl MediaTab {
@@ -41,12 +48,99 @@ impl MediaTab {
             Self::Images => "รูปภาพ",
             Self::Files => "ไฟล์",
             Self::Links => "ลิงก์",
+            Self::Members => "สมาชิก",
         }
     }
 }
 
 /// Dark ink on the brand green keeps message text above 4.5:1.
 const ON_BUBBLE: u32 = 0x10281A;
+
+/// Shared member row used in both the right-hand Members panel and the Members dialog.
+fn render_member_row(
+    i: usize,
+    m: ChatParticipant,
+    id_prefix: &'static str,
+    store: &Entity<Store>,
+    room: gpui::WeakEntity<RoomView>,
+    cx: &mut App,
+    p: &Palette,
+) -> AnyElement {
+    let img = m
+        .avatar_url
+        .as_deref()
+        .and_then(|u| store.update(cx, |s, cx| s.image(u, cx)));
+    let role_label = match m.role.as_str() {
+        "owner" => Some("เจ้าของกลุ่ม"),
+        "admin" => Some("แอดมิน"),
+        _ => None,
+    };
+    let member_for_click = m.clone();
+    div()
+        .id(SharedString::from(format!(
+            "{id_prefix}-member-{i}-{}",
+            m.user_id
+        )))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .p(px(8.))
+        .rounded(px(8.))
+        .cursor_pointer()
+        .hover(|s| s.bg(p.surface_muted))
+        .child(avatar(img, 36., p))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(p.ink)
+                                .child(m.name),
+                        )
+                        .when(m.is_official, |d| d.child(verified_badge(13., p))),
+                )
+                .when(!m.username.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(p.ink_subtitle)
+                            .child(format!("@{}", m.username)),
+                    )
+                }),
+        )
+        .when_some(role_label, |d, role| {
+            d.child(
+                div()
+                    .flex_none()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .bg(p.primary_tint)
+                    .text_size(px(11.))
+                    .text_color(p.primary_ink)
+                    .child(role),
+            )
+        })
+        .on_click(move |_, window, cx| {
+            let member = member_for_click.clone();
+            let _ = room.update(cx, |this, cx| {
+                this.open_profile_dialog(member, window, cx);
+            });
+        })
+        .into_any_element()
+}
 
 /// Detect animated GIF / WebP attachments sent as `File` or `Image` messages.
 fn animated_badge(m: &Message) -> Option<&'static str> {
@@ -63,6 +157,28 @@ fn animated_badge(m: &Message) -> Option<&'static str> {
     None
 }
 
+/// Detect video attachments sent as `File` messages by extension.
+fn is_video_message(m: &Message) -> bool {
+    if m.message_type != MessageType::File {
+        return false;
+    }
+    let candidates = [m.file_name.as_deref(), m.media_url.as_deref()];
+    for raw in candidates.into_iter().flatten() {
+        let clean = raw
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(raw)
+            .to_ascii_lowercase();
+        if [".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".3gp"]
+            .iter()
+            .any(|ext| clean.ends_with(ext))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct RoomView {
     store: Entity<Store>,
     composer: Entity<InputState>,
@@ -75,13 +191,29 @@ pub struct RoomView {
     last_chat: Option<String>,
     room_epoch: u64,
     panel: Option<MediaTab>,
+    panel_scroll: ScrollHandle,
+    members_dialog_scroll: ScrollHandle,
+    group_info_scroll: ScrollHandle,
+    group_name_input: Entity<InputState>,
     drafts: std::collections::HashMap<String, (String, Option<ReplyTarget>)>,
     scroll_states: std::collections::HashMap<String, (bool, Point<Pixels>)>,
+    emoji_open: bool,
+    emoji_tab: EmojiCategory,
+    emoji_search: Entity<InputState>,
+    emoji_prefs: EmojiPrefs,
 }
 
 impl RoomView {
     pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| InputState::new(window, cx).placeholder("ข้อความ"));
+        let emoji_search = cx.new(|cx| InputState::new(window, cx).placeholder("ค้นหาอีโมจิ..."));
+        let group_name_input = cx.new(|cx| InputState::new(window, cx).placeholder("ชื่อกลุ่ม"));
+        cx.subscribe(&emoji_search, |_, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(
             &composer,
             window,
@@ -179,8 +311,20 @@ impl RoomView {
             panel: (cfg!(debug_assertions)
                 && std::env::var("PINTO_PREVIEW").is_ok_and(|v| v.contains("panel")))
             .then_some(MediaTab::Files),
+            panel_scroll: ScrollHandle::new(),
+            members_dialog_scroll: ScrollHandle::new(),
+            group_info_scroll: ScrollHandle::new(),
+            group_name_input,
             drafts: std::collections::HashMap::new(),
             scroll_states: std::collections::HashMap::new(),
+            emoji_open: false,
+            emoji_tab: EmojiCategory::Recent,
+            emoji_search,
+            emoji_prefs: if cfg!(debug_assertions) && std::env::var("PINTO_PREVIEW").is_ok() {
+                EmojiPrefs::default()
+            } else {
+                EmojiPrefs::load()
+            },
         }
     }
 
@@ -229,6 +373,7 @@ impl RoomView {
             return;
         }
         let reply = self.reply.take().map(|r| r.message_id);
+        self.emoji_open = false;
         self.composer
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.typing_epoch += 1;
@@ -484,6 +629,7 @@ impl RoomView {
                         .flex_wrap()
                         .gap(px(4.))
                         .children(items.into_iter().enumerate().map(|(i, (url, data))| {
+                            let click_url = url.clone();
                             div()
                                 .id(("media-img", i))
                                 .size(px(92.))
@@ -503,7 +649,15 @@ impl RoomView {
                                     None => icon(IconName::Image, 18., p.ink_disabled)
                                         .into_any_element(),
                                 })
-                                .on_click(move |_, _, cx| cx.open_url(&url))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_image_dialog(
+                                        click_url.clone(),
+                                        None,
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                }))
                         }))
                         .into_any_element()
                 }
@@ -522,6 +676,16 @@ impl RoomView {
                         .flex_col()
                         .children(files.into_iter().enumerate().map(|(i, m)| {
                             let url = m.media_url.clone();
+                            let is_video = is_video_message(m);
+                            let file_name = m.file_name.clone().unwrap_or_else(|| {
+                                if is_video {
+                                    "วิดีโอ"
+                                } else {
+                                    "ไฟล์"
+                                }
+                                .into()
+                            });
+                            let file_size = m.file_size;
                             let meta = match m.file_size {
                                 Some(sz) => format!(
                                     "{} · {}",
@@ -550,7 +714,16 @@ impl RoomView {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .child(icon(IconName::File, 18., p.ink_secondary)),
+                                        .child(if is_video {
+                                            div()
+                                                .text_size(px(13.))
+                                                .text_color(p.primary_ink)
+                                                .child("▶")
+                                                .into_any_element()
+                                        } else {
+                                            icon(IconName::File, 18., p.ink_secondary)
+                                                .into_any_element()
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -561,11 +734,7 @@ impl RoomView {
                                                 .truncate()
                                                 .text_size(px(14.))
                                                 .text_color(p.ink)
-                                                .child(
-                                                    m.file_name
-                                                        .clone()
-                                                        .unwrap_or_else(|| "ไฟล์".into()),
-                                                ),
+                                                .child(file_name.clone()),
                                         )
                                         .child(
                                             div()
@@ -575,11 +744,21 @@ impl RoomView {
                                                 .child(meta),
                                         ),
                                 )
-                                .on_click(move |_, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(u) = &url {
-                                        cx.open_url(u);
+                                        if is_video {
+                                            this.open_video_dialog(
+                                                u.clone(),
+                                                file_name.clone(),
+                                                file_size,
+                                                window,
+                                                cx,
+                                            );
+                                        } else {
+                                            cx.open_url(u);
+                                        }
                                     }
-                                })
+                                }))
                         }))
                         .into_any_element()
                 }
@@ -658,6 +837,34 @@ impl RoomView {
                         .into_any_element()
                 }
             }
+            MediaTab::Members => {
+                let members = self
+                    .store
+                    .read(cx)
+                    .selected()
+                    .map(|c| c.participants())
+                    .unwrap_or_default();
+                let store = self.store.clone();
+                let room = cx.entity().downgrade();
+                if members.is_empty() {
+                    div()
+                        .py(px(48.))
+                        .text_center()
+                        .text_size(px(14.))
+                        .text_color(p.ink_subtitle)
+                        .child("ไม่พบข้อมูลสมาชิก")
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .children(members.into_iter().enumerate().map(|(i, m)| {
+                            render_member_row(i, m, "panel", &store, room.clone(), cx, p)
+                        }))
+                        .into_any_element()
+                }
+            }
         };
 
         let tab_btn = |t: MediaTab, cx: &mut Context<Self>| {
@@ -689,6 +896,12 @@ impl RoomView {
                 .on_click(cx.listener(move |this, _, _, cx| this.open_panel(t, cx)))
         };
 
+        let is_group = self
+            .store
+            .read(cx)
+            .selected()
+            .is_some_and(|c| c.chat_type == ChatType::Group);
+
         div()
             .w(px(320.))
             .h_full()
@@ -702,11 +915,12 @@ impl RoomView {
                 div()
                     .flex()
                     .items_end()
-                    .gap(px(20.))
+                    .gap(px(16.))
                     .pl(px(16.))
                     .pr(px(8.))
                     .border_b_1()
                     .border_color(p.divider)
+                    .when(is_group, |d| d.child(tab_btn(MediaTab::Members, cx)))
                     .child(tab_btn(MediaTab::Images, cx))
                     .child(tab_btn(MediaTab::Files, cx))
                     .child(tab_btn(MediaTab::Links, cx))
@@ -722,12 +936,19 @@ impl RoomView {
             )
             .child(
                 div()
-                    .id("panel-scroll")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .p(px(12.))
-                    .child(body),
+                    .child(
+                        div()
+                            .id("panel-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.panel_scroll)
+                            .p(px(12.))
+                            .child(body),
+                    )
+                    .vertical_scrollbar(&self.panel_scroll),
             )
             .into_any_element()
     }
@@ -805,7 +1026,7 @@ impl RoomView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(img("images/logo.png").size(px(48.))),
+                    .child(img("images/logo.png").size(px(48.)).rounded(px(12.))),
             )
             .child(
                 div()
@@ -827,6 +1048,11 @@ impl RoomView {
         let chat = store.selected().cloned();
         let connection = store.connection;
         let typing = chat.as_ref().is_some_and(|c| store.is_typing(&c.chat_id));
+        let official = chat.as_ref().is_some_and(|c| store.is_chat_official(c));
+        let partner_blocked = store
+            .selected_partner_id()
+            .as_deref()
+            .is_some_and(|id| store.is_blocked(id));
         let image = chat
             .as_ref()
             .and_then(|c| c.avatar_url.clone())
@@ -836,15 +1062,26 @@ impl RoomView {
             .as_ref()
             .map(|c| c.display_name().to_string())
             .unwrap_or_default();
+        let is_group = chat
+            .as_ref()
+            .is_some_and(|c| c.chat_type == ChatType::Group);
+        let member_count = chat
+            .as_ref()
+            .filter(|c| c.chat_type == ChatType::Group)
+            .map(|c| c.participants().len())
+            .unwrap_or(0);
         let (sub, sub_color) = if connection != ConnectionState::Connected {
             ("ออฟไลน์ · ข้อความจะส่งเมื่อเชื่อมต่อได้".to_string(), p.ink_subtitle)
         } else if typing {
             ("กำลังพิมพ์…".to_string(), p.primary_ink)
-        } else if chat
-            .as_ref()
-            .is_some_and(|c| c.chat_type == ChatType::Group)
-        {
-            ("กลุ่ม".to_string(), p.ink_subtitle)
+        } else if partner_blocked {
+            ("บล็อกผู้ใช้นี้อยู่".to_string(), p.error)
+        } else if is_group {
+            if member_count > 0 {
+                (format!("กลุ่ม · {member_count} สมาชิก"), p.ink_subtitle)
+            } else {
+                ("กลุ่ม".to_string(), p.ink_subtitle)
+            }
         } else {
             ("แชทส่วนตัว".to_string(), p.ink_subtitle)
         };
@@ -857,7 +1094,6 @@ impl RoomView {
             .items_center()
             .gap(px(12.))
             .px(px(16.))
-            .when(cfg!(target_os = "windows"), |d| d.pr(px(124.)))
             .bg(p.surface)
             .border_b_1()
             .border_color(p.divider)
@@ -869,10 +1105,19 @@ impl RoomView {
                         })),
                 )
             })
-            .child(avatar(image, 40., p))
             .child(
-                drag_region(div())
-                    .flex_1()
+                div()
+                    .id("header-chat-avatar")
+                    .when(is_group, |d| {
+                        d.cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_group_info_dialog(window, cx);
+                            }))
+                    })
+                    .child(avatar(image, 40., p)),
+            )
+            .child(
+                div()
                     .min_w_0()
                     .flex()
                     .flex_col()
@@ -890,21 +1135,38 @@ impl RoomView {
                                     .text_color(p.ink)
                                     .child(name),
                             )
+                            .when(official, |d| d.child(verified_badge(15., p)))
                             .when(muted, |d| {
                                 d.child(icon(IconName::BellOff, 14., p.ink_subtitle))
                             }),
                     )
                     .child(
                         div()
+                            .id("header-group-members")
+                            .self_start()
                             .flex()
                             .items_center()
                             .gap(px(6.))
                             .when(connection != ConnectionState::Connected, |d| {
                                 d.child(div().size(px(6.)).rounded_full().bg(p.ink_disabled))
                             })
-                            .child(div().text_size(px(12.)).text_color(sub_color).child(sub)),
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(sub_color)
+                                    .when(is_group, |d| {
+                                        d.cursor_pointer().hover(|s| s.text_color(p.primary_ink))
+                                    })
+                                    .child(sub),
+                            )
+                            .when(is_group, |d| {
+                                d.on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_members_dialog(window, cx);
+                                }))
+                            }),
                     ),
             )
+            .child(drag_region(div()).flex_1().h_full())
             .child(
                 Button::new("room-menu")
                     .ghost()
@@ -914,29 +1176,43 @@ impl RoomView {
                         let Some(view) = room.upgrade() else {
                             return menu;
                         };
-                        let (muted, wallpaper) = {
+                        let (muted, wallpaper, partner_id, blocked, is_group) = {
                             let s = view.read(cx).store.read(cx);
+                            let pid = s.selected_partner_id();
+                            let blk = pid.as_deref().is_some_and(|id| s.is_blocked(id));
+                            let grp = s.selected().is_some_and(|c| c.chat_type == ChatType::Group);
                             (
                                 s.selected().is_some_and(|c| c.is_muted),
                                 s.settings.wallpaper,
+                                pid,
+                                blk,
+                                grp,
                             )
                         };
                         // Every row drawn the same way, so icons and labels share one column.
+                        let row_colored =
+                            move |label: &'static str, name: Option<IconName>, danger: bool| {
+                                let fg = if danger { pal.error_strong } else { pal.ink };
+                                let ic = if danger {
+                                    pal.error_strong
+                                } else {
+                                    pal.ink_secondary
+                                };
+                                PopupMenuItem::element(move |_, _| {
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .text_color(fg)
+                                        .child(match name {
+                                            Some(n) => icon(n, 16., ic).into_any_element(),
+                                            None => div().size(px(16.)).into_any_element(),
+                                        })
+                                        .child(label)
+                                })
+                            };
                         let row = move |label: &'static str, name: Option<IconName>| {
-                            PopupMenuItem::element(move |_, _| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .text_color(pal.ink)
-                                    .child(match name {
-                                        Some(n) => {
-                                            icon(n, 16., pal.ink_secondary).into_any_element()
-                                        }
-                                        None => div().size(px(16.)).into_any_element(),
-                                    })
-                                    .child(label)
-                            })
+                            row_colored(label, name, false)
                         };
                         let act = |f: fn(&mut RoomView, &mut Window, &mut Context<RoomView>)| {
                             let room = room.clone();
@@ -959,7 +1235,43 @@ impl RoomView {
                             )
                             .on_click(act(|v, _, cx| v.toggle_mute(cx))),
                         )
+                        .when_some(partner_id, |m, pid| {
+                            let room = room.clone();
+                            m.item(
+                                row_colored(
+                                    if blocked {
+                                        "ปลดบล็อกผู้ใช้"
+                                    } else {
+                                        "บล็อกผู้ใช้"
+                                    },
+                                    Some(if blocked {
+                                        IconName::ShieldCheck
+                                    } else {
+                                        IconName::Ban
+                                    }),
+                                    !blocked,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    let pid = pid.clone();
+                                    let _ = room.update(cx, |v, cx| {
+                                        v.store.update(cx, |s, cx| {
+                                            if blocked {
+                                                s.unblock_user(pid, cx);
+                                            } else {
+                                                s.block_user(pid, cx);
+                                            }
+                                        });
+                                    });
+                                }),
+                            )
+                        })
                         .separator()
+                        .when(is_group, |m| {
+                            m.item(
+                                row("สมาชิกในกลุ่ม", Some(IconName::Users))
+                                    .on_click(act(|v, _, cx| v.open_panel(MediaTab::Members, cx))),
+                            )
+                        })
                         .item(
                             row("รูปภาพ", Some(IconName::Image))
                                 .on_click(act(|v, _, cx| v.open_panel(MediaTab::Images, cx))),
@@ -1149,50 +1461,155 @@ impl RoomView {
             );
         }
         if is_visual_media {
-            bubble = bubble.child(match media {
-                Some(img_data) => div()
-                    .relative()
-                    .child(
-                        img(img_data)
-                            .max_w(px(280.))
-                            .max_h(px(320.))
-                            .rounded(px(8.)),
-                    )
-                    .when_some(anim_badge, |d, label| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .top(px(6.))
-                                .left(px(6.))
-                                .px(px(6.))
-                                .py(px(2.))
-                                .rounded(px(4.))
-                                .bg(p.overlay.opacity(0.75))
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(p.surface)
-                                .child(label),
-                        )
+            let click_url = m.media_url.clone();
+            let click_name = m.file_name.clone();
+            let media_id = SharedString::from(format!("msg-img-{}", m.message_id));
+            bubble = bubble.child(
+                div()
+                    .id(media_id)
+                    .when(click_url.is_some(), |d| d.cursor_pointer())
+                    .child(match media {
+                        Some(img_data) => div()
+                            .relative()
+                            .child(
+                                img(img_data)
+                                    .max_w(px(280.))
+                                    .max_h(px(320.))
+                                    .rounded(px(8.)),
+                            )
+                            .when_some(anim_badge, |d, label| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(6.))
+                                        .left(px(6.))
+                                        .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
+                                        .bg(black().opacity(0.55))
+                                        .text_size(px(10.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(white())
+                                        .child(label),
+                                )
+                            })
+                            .into_any_element(),
+                        None => div()
+                            .w(px(220.))
+                            .h(px(140.))
+                            .rounded(px(8.))
+                            .bg(if own {
+                                fg.opacity(0.1)
+                            } else {
+                                p.surface_muted
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(icon(IconName::Image, 24., meta))
+                            .into_any_element(),
                     })
-                    .into_any_element(),
-                None => div()
-                    .w(px(220.))
-                    .h(px(140.))
-                    .rounded(px(8.))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(u) = &click_url {
+                            this.open_image_dialog(
+                                u.clone(),
+                                click_name.clone(),
+                                anim_badge,
+                                window,
+                                cx,
+                            );
+                        }
+                    })),
+            );
+        } else if is_video_message(m) {
+            let click_url = m.media_url.clone();
+            let vname = m.file_name.clone().unwrap_or_else(|| "วิดีโอ".into());
+            let vsize = m.file_size;
+            let video_id = SharedString::from(format!("msg-vid-{}", m.message_id));
+            bubble = bubble.child(
+                div()
+                    .id(video_id)
+                    .w(px(240.))
+                    .rounded(px(10.))
+                    .overflow_hidden()
                     .bg(if own {
                         fg.opacity(0.1)
                     } else {
                         p.surface_muted
                     })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon(IconName::Image, 24., meta))
-                    .into_any_element(),
-            });
+                    .when(click_url.is_some(), |d| d.cursor_pointer())
+                    .child(
+                        div()
+                            .h(px(120.))
+                            .relative()
+                            .bg(black().opacity(0.35))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .size(px(44.))
+                                    .rounded_full()
+                                    .bg(black().opacity(0.6))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(16.))
+                                    .text_color(white())
+                                    .child("▶"),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(8.))
+                                    .left(px(8.))
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded(px(6.))
+                                    .bg(black().opacity(0.55))
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(white())
+                                    .child("วิดีโอ"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .child(vname.clone()),
+                            )
+                            .when_some(vsize, |d, s| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.))
+                                        .text_color(meta)
+                                        .child(format::file_size(s)),
+                                )
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(u) = &click_url {
+                            this.open_video_dialog(u.clone(), vname.clone(), vsize, window, cx);
+                        }
+                    })),
+            );
         } else if m.message_type == MessageType::File {
+            let click_url = m.media_url.clone();
+            let file_id = SharedString::from(format!("msg-file-{}", m.message_id));
             bubble = bubble.child(
                 div()
+                    .id(file_id)
                     .flex()
                     .items_center()
                     .gap(px(8.))
@@ -1203,6 +1620,7 @@ impl RoomView {
                     } else {
                         p.surface_muted
                     })
+                    .when(click_url.is_some(), |d| d.cursor_pointer())
                     .child(icon(IconName::File, 16., fg))
                     .child(
                         div()
@@ -1218,6 +1636,11 @@ impl RoomView {
                                 .text_color(meta)
                                 .child(format::file_size(s)),
                         )
+                    })
+                    .on_click(move |_, _, cx| {
+                        if let Some(u) = &click_url {
+                            cx.open_url(u);
+                        }
                     }),
             );
         }
@@ -1448,13 +1871,1083 @@ impl RoomView {
             .into_any_element()
     }
 
+    fn insert_emoji(&mut self, emoji: &str, window: &mut Window, cx: &mut Context<Self>) {
+        record_recent(&mut self.emoji_prefs.recent, emoji);
+        if !(cfg!(debug_assertions) && std::env::var("PINTO_PREVIEW").is_ok()) {
+            self.emoji_prefs.save();
+        }
+        let cur = self.composer.read(cx).value().to_string();
+        let next = format!("{cur}{emoji}");
+        if next.chars().count() <= MAX_MESSAGE_LENGTH {
+            self.composer
+                .update(cx, |s, cx| s.set_value(next, window, cx));
+        }
+        self.composer.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    fn open_group_info_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.store.read(cx).selected().cloned() else {
+            return;
+        };
+        if chat.chat_type != ChatType::Group {
+            return;
+        }
+        let chat_id = chat.chat_id.clone();
+        self.group_info_scroll.set_offset(point(px(0.), px(0.)));
+        self.group_name_input.update(cx, |s, cx| {
+            s.set_value(chat.display_name().to_string(), window, cx);
+        });
+        self.store.update(cx, |s, cx| {
+            s.load_friends(false, cx);
+            s.load_chat_detail(&chat_id, cx);
+        });
+
+        let store = self.store.clone();
+        let room = cx.entity().downgrade();
+        let name_input = self.group_name_input.clone();
+        let scroll = self.group_info_scroll.clone();
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let p = cx.palette();
+            let (chat, my_role, me_id, friends) = {
+                let s = store.read(cx);
+                let c = s
+                    .selected()
+                    .filter(|c| c.chat_id == chat_id)
+                    .cloned()
+                    .unwrap_or_else(|| chat.clone());
+                let role = s.my_group_role(&c);
+                let me = s
+                    .user
+                    .as_ref()
+                    .map(|u| u.user_id.clone())
+                    .unwrap_or_default();
+                let friends = s.friends.clone();
+                (c, role, me, friends)
+            };
+            let is_owner = my_role == "owner";
+            let is_admin = my_role == "admin";
+            let can_manage_members = is_owner || is_admin;
+            let role_label = match my_role.as_str() {
+                "owner" => "เจ้าของกลุ่ม",
+                "admin" => "แอดมิน",
+                _ => "สมาชิก",
+            };
+            let avatar_img = chat
+                .avatar_url
+                .clone()
+                .and_then(|u| store.update(cx, |s, cx| s.image(&u, cx)));
+            let members = chat.participants();
+            let member_ids: std::collections::HashSet<String> =
+                members.iter().map(|m| m.user_id.clone()).collect();
+            let addable_friends: Vec<UserProfile> = friends
+                .into_iter()
+                .filter(|f| !member_ids.contains(&f.user_id))
+                .take(20)
+                .collect();
+
+            let store_avatar = store.clone();
+            let cid_avatar = chat_id.clone();
+            let store_rename = store.clone();
+            let cid_rename = chat_id.clone();
+            let input_rename = name_input.clone();
+            let store_invite = store.clone();
+            let cid_invite = chat_id.clone();
+            let store_leave = store.clone();
+            let cid_leave = chat_id.clone();
+            let me_leave = me_id.clone();
+
+            let chip_btn = |id: SharedString, label: &'static str, danger: bool| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if danger {
+                        p.error.opacity(0.4)
+                    } else {
+                        p.hairline
+                    })
+                    .bg(p.surface_muted)
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(if danger { p.error_strong } else { p.ink })
+                    .hover(|s| s.bg(p.divider))
+                    .child(label)
+            };
+
+            dialog.title("ข้อมูลกลุ่ม").w(px(460.)).footer(div()).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(14.))
+                            .child(avatar(avatar_img, 64., &p))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(div().flex_1().child(Input::new(&name_input)))
+                                            .child(
+                                                div()
+                                                    .id("group-save-name")
+                                                    .px(px(12.))
+                                                    .h(px(34.))
+                                                    .rounded(px(8.))
+                                                    .bg(p.primary)
+                                                    .cursor_pointer()
+                                                    .flex()
+                                                    .items_center()
+                                                    .text_size(px(13.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(ON_BUBBLE))
+                                                    .hover(|s| s.bg(p.primary_hover))
+                                                    .child("บันทึกชื่อ")
+                                                    .on_click(move |_, _, cx| {
+                                                        let val = input_rename
+                                                            .read(cx)
+                                                            .value()
+                                                            .to_string();
+                                                        store_rename.update(cx, |s, cx| {
+                                                            s.rename_group(
+                                                                cid_rename.clone(),
+                                                                val,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .id("group-change-avatar")
+                                                    .px(px(10.))
+                                                    .py(px(4.))
+                                                    .rounded(px(6.))
+                                                    .border_1()
+                                                    .border_color(p.hairline)
+                                                    .bg(p.surface_muted)
+                                                    .cursor_pointer()
+                                                    .text_size(px(12.))
+                                                    .text_color(p.ink)
+                                                    .hover(|s| s.bg(p.divider))
+                                                    .child("เปลี่ยนรูปกลุ่ม")
+                                                    .on_click(move |_, _, cx| {
+                                                        let paths = cx.prompt_for_paths(
+                                                            PathPromptOptions {
+                                                                files: true,
+                                                                directories: false,
+                                                                multiple: false,
+                                                                prompt: Some(
+                                                                    "เลือกรูปโปรไฟล์กลุ่ม".into(),
+                                                                ),
+                                                            },
+                                                        );
+                                                        let st = store_avatar.clone();
+                                                        let cid = cid_avatar.clone();
+                                                        cx.spawn(async move |cx| {
+                                                            let Ok(Ok(Some(paths))) = paths.await
+                                                            else {
+                                                                return;
+                                                            };
+                                                            let Some(path) =
+                                                                paths.into_iter().next()
+                                                            else {
+                                                                return;
+                                                            };
+                                                            st.update(cx, |s, cx| {
+                                                                s.update_group_avatar(
+                                                                    cid, path, cx,
+                                                                );
+                                                            });
+                                                        })
+                                                        .detach();
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("group-copy-invite")
+                                                    .px(px(10.))
+                                                    .py(px(4.))
+                                                    .rounded(px(6.))
+                                                    .border_1()
+                                                    .border_color(p.hairline)
+                                                    .bg(p.surface_muted)
+                                                    .cursor_pointer()
+                                                    .text_size(px(12.))
+                                                    .text_color(p.ink)
+                                                    .hover(|s| s.bg(p.divider))
+                                                    .child("คัดลอกลิงก์เชิญ")
+                                                    .on_click(move |_, _, cx| {
+                                                        store_invite.update(cx, |s, cx| {
+                                                            s.copy_group_invite(
+                                                                cid_invite.clone(),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(8.))
+                            .bg(p.surface_muted)
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(p.ink_secondary)
+                                    .child(format!("สมาชิก {} / 100 คน", members.len())),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.))
+                                    .py(px(2.))
+                                    .rounded(px(6.))
+                                    .bg(p.primary_tint)
+                                    .text_size(px(11.))
+                                    .text_color(p.primary_ink)
+                                    .child(format!("สิทธิ์ของคุณ: {role_label}")),
+                            ),
+                    )
+                    .when(can_manage_members && !addable_friends.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.ink_secondary)
+                                        .child("เพิ่มสมาชิก (คลิกเพื่อเชิญเข้ากลุ่ม)"),
+                                )
+                                .child(div().flex().flex_wrap().gap(px(6.)).children(
+                                    addable_friends.into_iter().enumerate().map(|(i, f)| {
+                                        let st = store.clone();
+                                        let cid = chat_id.clone();
+                                        let uid = f.user_id.clone();
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "add-friend-{i}-{}",
+                                                f.user_id
+                                            )))
+                                            .px(px(8.))
+                                            .py(px(4.))
+                                            .rounded(px(8.))
+                                            .border_1()
+                                            .border_color(p.hairline)
+                                            .bg(p.surface_muted)
+                                            .cursor_pointer()
+                                            .text_size(px(12.))
+                                            .text_color(p.ink)
+                                            .hover(|s| s.bg(p.primary_tint))
+                                            .child(format!("+ {}", f.display_name()))
+                                            .on_click(move |_, _, cx| {
+                                                st.update(cx, |s, cx| {
+                                                    s.add_group_participants(
+                                                        cid.clone(),
+                                                        vec![uid.clone()],
+                                                        cx,
+                                                    );
+                                                });
+                                            })
+                                    }),
+                                )),
+                        )
+                    })
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(240.))
+                            .child(
+                                div()
+                                    .id("group-info-members-scroll")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&scroll)
+                                    .pr(px(12.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .children(members.into_iter().enumerate().map(|(i, m)| {
+                                        let m_img = m
+                                            .avatar_url
+                                            .as_deref()
+                                            .and_then(|u| store.update(cx, |s, cx| s.image(u, cx)));
+                                        let m_role = match m.role.as_str() {
+                                            "owner" => Some("เจ้าของกลุ่ม"),
+                                            "admin" => Some("แอดมิน"),
+                                            _ => None,
+                                        };
+                                        let is_me = m.user_id == me_id;
+                                        let can_kick = !is_me
+                                            && (is_owner || (is_admin && m.role == "member"));
+                                        let can_role = is_owner && !is_me;
+                                        let click_member = m.clone();
+                                        let room_click = room.clone();
+
+                                        let uid_role = m.user_id.clone();
+                                        let next_role =
+                                            if m.role == "admin" { "member" } else { "admin" };
+                                        let role_btn_text = if m.role == "admin" {
+                                            "ลดสิทธิ์"
+                                        } else {
+                                            "ตั้งแอดมิน"
+                                        };
+                                        let st_role = store.clone();
+                                        let cid_role = chat_id.clone();
+
+                                        let uid_owner = m.user_id.clone();
+                                        let st_owner = store.clone();
+                                        let cid_owner = chat_id.clone();
+
+                                        let uid_kick = m.user_id.clone();
+                                        let st_kick = store.clone();
+                                        let cid_kick = chat_id.clone();
+
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "ginfo-member-{i}-{}",
+                                                m.user_id
+                                            )))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .p(px(6.))
+                                            .rounded(px(8.))
+                                            .hover(|s| s.bg(p.surface_muted))
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "ginfo-open-{i}-{}",
+                                                        m.user_id
+                                                    )))
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.))
+                                                    .cursor_pointer()
+                                                    .child(avatar(m_img, 32., &p))
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(4.))
+                                                                    .child(
+                                                                        div()
+                                                                            .truncate()
+                                                                            .text_size(px(13.))
+                                                                            .font_weight(
+                                                                                FontWeight::MEDIUM,
+                                                                            )
+                                                                            .text_color(p.ink)
+                                                                            .child(m.name),
+                                                                    )
+                                                                    .when(m.is_official, |d| {
+                                                                        d.child(verified_badge(
+                                                                            12., &p,
+                                                                        ))
+                                                                    }),
+                                                            )
+                                                            .when_some(m_role, |d, rl| {
+                                                                d.child(
+                                                                    div()
+                                                                        .text_size(px(11.))
+                                                                        .text_color(p.primary_ink)
+                                                                        .child(rl),
+                                                                )
+                                                            }),
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        let target = click_member.clone();
+                                                        let _ =
+                                                            room_click.update(cx, |this, cx| {
+                                                                this.open_profile_dialog(
+                                                                    target, window, cx,
+                                                                );
+                                                            });
+                                                    }),
+                                            )
+                                            .when(can_role, |d| {
+                                                d.child(
+                                                    chip_btn(
+                                                        SharedString::from(format!(
+                                                            "ginfo-role-{i}"
+                                                        )),
+                                                        role_btn_text,
+                                                        false,
+                                                    )
+                                                    .on_click(move |_, _, cx| {
+                                                        st_role.update(cx, |s, cx| {
+                                                            s.update_participant_role(
+                                                                cid_role.clone(),
+                                                                uid_role.clone(),
+                                                                next_role.to_string(),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                                .child(
+                                                    chip_btn(
+                                                        SharedString::from(format!(
+                                                            "ginfo-owner-{i}"
+                                                        )),
+                                                        "โอนเจ้าของ",
+                                                        false,
+                                                    )
+                                                    .on_click(move |_, _, cx| {
+                                                        st_owner.update(cx, |s, cx| {
+                                                            s.transfer_group_ownership(
+                                                                cid_owner.clone(),
+                                                                uid_owner.clone(),
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                            })
+                                            .when(can_kick, |d| {
+                                                d.child(
+                                                    chip_btn(
+                                                        SharedString::from(format!(
+                                                            "ginfo-kick-{i}"
+                                                        )),
+                                                        "ลบ",
+                                                        true,
+                                                    )
+                                                    .on_click(move |_, _, cx| {
+                                                        st_kick.update(cx, |s, cx| {
+                                                            s.remove_group_participant(
+                                                                cid_kick.clone(),
+                                                                uid_kick.clone(),
+                                                                false,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    }),
+                                                )
+                                            })
+                                    })),
+                            )
+                            .vertical_scrollbar(&scroll),
+                    )
+                    .child(if is_owner {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.ink_subtitle)
+                            .text_center()
+                            .child("ต้องโอนสิทธิ์เจ้าของกลุ่มให้สมาชิกอื่นก่อนจึงจะออกจากกลุ่มได้")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id("group-leave-btn")
+                            .w_full()
+                            .h(px(34.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(p.error.opacity(0.35))
+                            .bg(p.surface_muted)
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .text_color(p.error_strong)
+                            .hover(|s| s.bg(p.divider))
+                            .child("ออกจากกลุ่ม")
+                            .on_click(move |_, window, cx| {
+                                window.close_dialog(cx);
+                                store_leave.update(cx, |s, cx| {
+                                    s.remove_group_participant(
+                                        cid_leave.clone(),
+                                        me_leave.clone(),
+                                        true,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .into_any_element()
+                    }),
+            )
+        });
+    }
+
+    fn open_members_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.members_dialog_scroll.set_offset(point(px(0.), px(0.)));
+        let store = self.store.clone();
+        let room = cx.entity().downgrade();
+        let scroll = self.members_dialog_scroll.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let p = cx.palette();
+            let members = store
+                .read(cx)
+                .selected()
+                .map(|c| c.participants())
+                .unwrap_or_default();
+            let title = if members.is_empty() {
+                "สมาชิกกลุ่ม".to_string()
+            } else {
+                format!("สมาชิกกลุ่ม ({})", members.len())
+            };
+            let body: AnyElement = if members.is_empty() {
+                div()
+                    .py(px(36.))
+                    .text_center()
+                    .text_size(px(14.))
+                    .text_color(p.ink_subtitle)
+                    .child("ไม่พบข้อมูลสมาชิก")
+                    .into_any_element()
+            } else {
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(400.))
+                    .child(
+                        div()
+                            .id("members-dialog-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&scroll)
+                            .pr(px(12.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .children(members.into_iter().enumerate().map(|(i, m)| {
+                                render_member_row(i, m, "dialog", &store, room.clone(), cx, &p)
+                            })),
+                    )
+                    .vertical_scrollbar(&scroll)
+                    .into_any_element()
+            };
+            dialog.title(title).w(px(380.)).footer(div()).child(body)
+        });
+    }
+
+    fn open_profile_dialog(
+        &mut self,
+        member: ChatParticipant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let room = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let p = cx.palette();
+            let img = member
+                .avatar_url
+                .as_deref()
+                .and_then(|u| store.update(cx, |s, cx| s.image(u, cx)));
+            let (is_self, blocked) = {
+                let s = store.read(cx);
+                (
+                    s.user.as_ref().is_some_and(|u| u.user_id == member.user_id),
+                    s.is_blocked(&member.user_id),
+                )
+            };
+            let role_label = match member.role.as_str() {
+                "owner" => "เจ้าของกลุ่ม",
+                "admin" => "แอดมิน",
+                _ => "สมาชิก",
+            };
+            let profile = UserProfile {
+                user_id: member.user_id.clone(),
+                username: member.username.clone(),
+                name: member.name.clone(),
+                profile_image: member.avatar_url.clone(),
+                is_official: member.is_official,
+            };
+            let uid = member.user_id.clone();
+            let store_msg = store.clone();
+            let store_blk = store.clone();
+            let room_msg = room.clone();
+
+            dialog.w(px(340.)).footer(div()).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .pb(px(4.))
+                    .child(avatar(img, 72., &p))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.ink)
+                                    .child(member.name.clone()),
+                            )
+                            .when(member.is_official, |d| d.child(verified_badge(16., &p))),
+                    )
+                    .when(!member.username.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(p.ink_subtitle)
+                                .child(format!("@{}", member.username)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(8.))
+                            .bg(p.primary_tint)
+                            .text_size(px(12.))
+                            .text_color(p.primary_ink)
+                            .child(role_label),
+                    )
+                    .when(!is_self, |d| {
+                        d.child(
+                            div()
+                                .w_full()
+                                .pt(px(8.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .id("profile-send-msg")
+                                        .w_full()
+                                        .h(px(36.))
+                                        .rounded(px(10.))
+                                        .bg(p.primary)
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(6.))
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(ON_BUBBLE))
+                                        .hover(|s| s.bg(p.primary_hover))
+                                        .child(icon(
+                                            IconName::MessageCircle,
+                                            16.,
+                                            rgb(ON_BUBBLE).into(),
+                                        ))
+                                        .child("ส่งข้อความ")
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ = room_msg.update(cx, |r, cx| {
+                                                r.panel = None;
+                                                cx.notify();
+                                            });
+                                            store_msg.update(cx, |s, cx| {
+                                                s.open_direct(&profile, cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("profile-toggle-block")
+                                        .w_full()
+                                        .h(px(34.))
+                                        .rounded(px(10.))
+                                        .border_1()
+                                        .border_color(p.hairline)
+                                        .bg(p.surface_muted)
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(6.))
+                                        .text_size(px(13.))
+                                        .text_color(if blocked { p.ink } else { p.error_strong })
+                                        .hover(|s| s.bg(p.divider))
+                                        .child(icon(
+                                            if blocked {
+                                                IconName::ShieldCheck
+                                            } else {
+                                                IconName::Ban
+                                            },
+                                            15.,
+                                            if blocked { p.ink } else { p.error_strong },
+                                        ))
+                                        .child(if blocked {
+                                            "ปลดบล็อกผู้ใช้"
+                                        } else {
+                                            "บล็อกผู้ใช้"
+                                        })
+                                        .on_click(move |_, _, cx| {
+                                            let id = uid.clone();
+                                            store_blk.update(cx, |s, cx| {
+                                                if blocked {
+                                                    s.unblock_user(id, cx);
+                                                } else {
+                                                    s.block_user(id, cx);
+                                                }
+                                            });
+                                        }),
+                                ),
+                        )
+                    }),
+            )
+        });
+    }
+
+    fn open_image_dialog(
+        &mut self,
+        url: String,
+        title: Option<String>,
+        badge: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let p = cx.palette();
+            let img_data = store.update(cx, |s, cx| s.image(&url, cx));
+            let open_url = url.clone();
+            let heading = title.clone().unwrap_or_else(|| "รูปภาพ".into());
+            dialog.title(heading).w(px(640.)).footer(div()).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(match img_data {
+                        Some(data) => div()
+                            .relative()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                img(data)
+                                    .max_w(px(590.))
+                                    .max_h(px(460.))
+                                    .object_fit(ObjectFit::Contain)
+                                    .rounded(px(10.)),
+                            )
+                            .when_some(badge, |d, label| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(8.))
+                                        .left(px(8.))
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
+                                        .bg(black().opacity(0.55))
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(white())
+                                        .child(label),
+                                )
+                            })
+                            .into_any_element(),
+                        None => div()
+                            .w(px(360.))
+                            .h(px(240.))
+                            .rounded(px(10.))
+                            .bg(p.surface_muted)
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(8.))
+                            .child(icon(IconName::Image, 28., p.ink_disabled))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(p.ink_subtitle)
+                                    .child("กำลังโหลดรูปภาพ..."),
+                            )
+                            .into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("media-open-browser")
+                                    .px(px(14.))
+                                    .h(px(34.))
+                                    .rounded(px(8.))
+                                    .border_1()
+                                    .border_color(p.hairline)
+                                    .bg(p.surface_muted)
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_size(px(13.))
+                                    .text_color(p.ink)
+                                    .hover(|s| s.bg(p.divider))
+                                    .child(icon(IconName::Download, 14., p.ink_secondary))
+                                    .child("เปิดในเบราว์เซอร์")
+                                    .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                            )
+                            .child(
+                                div()
+                                    .id("media-dialog-close")
+                                    .px(px(14.))
+                                    .h(px(34.))
+                                    .rounded(px(8.))
+                                    .bg(p.primary)
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(ON_BUBBLE))
+                                    .hover(|s| s.bg(p.primary_hover))
+                                    .child("ปิด")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            ),
+                    ),
+            )
+        });
+    }
+
+    fn open_video_dialog(
+        &mut self,
+        url: String,
+        name: String,
+        size: Option<i64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let p = cx.palette();
+            let play_url = url.clone();
+            let btn_url = url.clone();
+            let title = name.clone();
+            dialog.title("วิดีโอ").w(px(460.)).footer(div()).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .id("video-preview-play")
+                            .w_full()
+                            .h(px(220.))
+                            .rounded(px(12.))
+                            .bg(p.surface_muted)
+                            .border_1()
+                            .border_color(p.hairline)
+                            .cursor_pointer()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(10.))
+                            .hover(|s| s.bg(p.divider))
+                            .child(
+                                div()
+                                    .size(px(56.))
+                                    .rounded_full()
+                                    .bg(p.primary)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(20.))
+                                    .text_color(rgb(ON_BUBBLE))
+                                    .child("▶"),
+                            )
+                            .child(
+                                div()
+                                    .px(px(16.))
+                                    .truncate()
+                                    .max_w_full()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.ink)
+                                    .child(title.clone()),
+                            )
+                            .when_some(size, |d, sz| {
+                                d.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(p.ink_subtitle)
+                                        .child(format::file_size(sz)),
+                                )
+                            })
+                            .on_click(move |_, _, cx| cx.open_url(&play_url)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("video-open-external")
+                                    .px(px(14.))
+                                    .h(px(34.))
+                                    .rounded(px(8.))
+                                    .bg(p.primary)
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(ON_BUBBLE))
+                                    .hover(|s| s.bg(p.primary_hover))
+                                    .child("เปิดเล่นวิดีโอ")
+                                    .on_click(move |_, _, cx| cx.open_url(&btn_url)),
+                            )
+                            .child(
+                                div()
+                                    .id("video-dialog-close")
+                                    .px(px(14.))
+                                    .h(px(34.))
+                                    .rounded(px(8.))
+                                    .border_1()
+                                    .border_color(p.hairline)
+                                    .bg(p.surface_muted)
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(13.))
+                                    .text_color(p.ink)
+                                    .hover(|s| s.bg(p.divider))
+                                    .child("ปิด")
+                                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                            ),
+                    ),
+            )
+        });
+    }
+
     fn render_composer(&self, cx: &mut Context<Self>, p: &Palette) -> impl IntoElement {
         let has_text = !self.composer.read(cx).value().trim().is_empty();
+        let room_tab = cx.entity().downgrade();
+        let room_pick = cx.entity().downgrade();
+        let room_clear = cx.entity().downgrade();
+        let room_tone = cx.entity().downgrade();
+        let room_clear_search = cx.entity().downgrade();
         div()
             .flex_none()
+            .relative()
             .px(px(24.))
             .pb(px(16.))
             .pt(px(8.))
+            .when(self.emoji_open, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .bottom(px(64.))
+                        .left(px(24.))
+                        .child(render_emoji_panel(
+                            self.emoji_tab,
+                            &self.emoji_prefs,
+                            self.emoji_search.read(cx),
+                            &self.emoji_search,
+                            p,
+                            EmojiPanelCallbacks {
+                                on_tab: move |cat: EmojiCategory, _: &mut Window, cx: &mut App| {
+                                    if let Some(v) = room_tab.upgrade() {
+                                        v.update(cx, |this, cx| {
+                                            this.emoji_tab = cat;
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                                on_pick: move |emoji: String, window: &mut Window, cx: &mut App| {
+                                    if let Some(v) = room_pick.upgrade() {
+                                        v.update(cx, |this, cx| {
+                                            this.insert_emoji(&emoji, window, cx);
+                                        });
+                                    }
+                                },
+                                on_clear_recent: move |_: &mut Window, cx: &mut App| {
+                                    if let Some(v) = room_clear.upgrade() {
+                                        v.update(cx, |this, cx| {
+                                            this.emoji_prefs.recent.clear();
+                                            if !(cfg!(debug_assertions)
+                                                && std::env::var("PINTO_PREVIEW").is_ok())
+                                            {
+                                                this.emoji_prefs.save();
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                                on_skin_tone:
+                                    move |tone: super::emoji::SkinTone,
+                                          _: &mut Window,
+                                          cx: &mut App| {
+                                        if let Some(v) = room_tone.upgrade() {
+                                            v.update(cx, |this, cx| {
+                                                this.emoji_prefs.skin_tone = tone;
+                                                if !(cfg!(debug_assertions)
+                                                    && std::env::var("PINTO_PREVIEW").is_ok())
+                                                {
+                                                    this.emoji_prefs.save();
+                                                }
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
+                                on_clear_search: move |window: &mut Window, cx: &mut App| {
+                                    if let Some(v) = room_clear_search.upgrade() {
+                                        v.update(cx, |this, cx| {
+                                            this.emoji_search
+                                                .update(cx, |s, cx| s.set_value("", window, cx));
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                            },
+                        ))
+                        .with_animation(
+                            "emoji-panel-enter",
+                            Animation::new(Duration::from_millis(140))
+                                .with_easing(ease_out_quint()),
+                            |el, delta| el.opacity(delta).mb(px(6. * delta)),
+                        ),
+                )
+            })
             .flex()
             .flex_col()
             .items_center()
@@ -1521,6 +3014,26 @@ impl RoomView {
                             .rounded_full()
                             .on_click(cx.listener(|this, _, _, cx| this.attach(cx))),
                     )
+                    .child({
+                        let hover = p.surface_muted;
+                        div()
+                            .id("emoji-toggle")
+                            .size(px(32.))
+                            .flex_none()
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_size(px(17.))
+                            .when(self.emoji_open, |d| d.bg(p.primary_tint))
+                            .when(!self.emoji_open, |d| d.hover(move |s| s.bg(hover)))
+                            .child("😊")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.emoji_open = !this.emoji_open;
+                                cx.notify();
+                            }))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -1602,6 +3115,7 @@ impl Render for RoomView {
                         Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
                         |d, delta| d.opacity(0.35 + 0.65 * delta),
                     ))
+                    .vertical_scrollbar(&self.scroll)
                     .when(far, |d| {
                         d.child(
                             div()
@@ -1665,6 +3179,7 @@ impl Render for RoomView {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(p.background)
@@ -1684,7 +3199,7 @@ impl Render for RoomView {
 
 #[cfg(test)]
 mod tests {
-    use super::animated_badge;
+    use super::{animated_badge, is_video_message};
     use crate::models::{Message, MessageType};
 
     #[test]
@@ -1699,5 +3214,19 @@ mod tests {
 
         msg.media_url = Some("https://cdn.example.com/photo.png".into());
         assert_eq!(animated_badge(&msg), None);
+    }
+
+    #[test]
+    fn detects_video_messages() {
+        let mut msg = Message::temp("c1", "u1", "", MessageType::File, None);
+        msg.file_name = Some("clip.MP4".into());
+        assert!(is_video_message(&msg));
+
+        msg.file_name = None;
+        msg.media_url = Some("https://cdn.example.com/demo.webm?token=123#t=1".into());
+        assert!(is_video_message(&msg));
+
+        msg.media_url = Some("https://cdn.example.com/report.pdf".into());
+        assert!(!is_video_message(&msg));
     }
 }

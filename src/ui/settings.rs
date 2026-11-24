@@ -9,7 +9,7 @@ use crate::{
     persist::ThemeMode,
     store::Store,
     theme::{Palette, PaletteExt},
-    ui::widgets::{avatar, drag_region, icon, icon_button, tnum},
+    ui::widgets::{avatar, drag_region, icon, icon_button, tnum, verified_badge},
 };
 
 pub enum SettingsEvent {
@@ -132,6 +132,7 @@ impl Render for SettingsView {
         let store = self.store.read(cx);
         let user = store.user.clone().unwrap_or_default();
         let settings = store.settings.clone();
+        let blocked = store.blocked_users.clone();
         let image = user
             .profile_image
             .clone()
@@ -142,8 +143,49 @@ impl Render for SettingsView {
             .flex()
             .flex_col()
             .bg(p.background)
-            // Strip for the window controls; it also drags the window.
-            .child(drag_region(div().h(px(32.)).w_full().flex_none()))
+            // Strip for the macOS traffic lights; Windows has `windows_titlebar`.
+            .when(!cfg!(target_os = "windows"), |d| {
+                d.child(drag_region(div().h(px(32.)).w_full().flex_none()))
+            })
+            // Sticky header so the Back button stays visible while scrolling.
+            .child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(p.hairline)
+                    .child(
+                        div()
+                            .mx_auto()
+                            .w_full()
+                            .max_w(px(672.))
+                            .px(px(24.))
+                            .py(px(12.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                icon_button(
+                                    "back",
+                                    IconName::ChevronLeft,
+                                    32.,
+                                    p.ink_secondary,
+                                    &p,
+                                )
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Back)),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(20.))
+                                    .line_height(px(28.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.ink)
+                                    .child("ตั้งค่า"),
+                            ),
+                    ),
+            )
             .child(
                 div()
                     .id("settings-scroll")
@@ -157,39 +199,11 @@ impl Render for SettingsView {
                             .w_full()
                             .max_w(px(672.))
                             .px(px(24.))
-                            .pt(px(8.))
+                            .pt(px(20.))
                             .pb(px(32.))
                             .flex()
                             .flex_col()
                             .gap(px(24.))
-                            // Page title on the card column's left edge, back arrow in front.
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .ml(px(-8.))
-                                    .child(
-                                        icon_button(
-                                            "back",
-                                            IconName::ChevronLeft,
-                                            32.,
-                                            p.ink_secondary,
-                                            &p,
-                                        )
-                                        .on_click(
-                                            cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Back)),
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(24.))
-                                            .line_height(px(32.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(p.ink)
-                                            .child("ตั้งค่า"),
-                                    ),
-                            )
                             .child(
                                 Self::section("บัญชี", &p).child(
                                     div()
@@ -311,52 +325,139 @@ impl Render for SettingsView {
                                         &p,
                                     )),
                             )
+                            .child(
+                                Self::section("ผู้ใช้ที่บล็อก", &p).child({
+                                    if blocked.is_empty() {
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(p.ink_subtitle)
+                                            .child("ยังไม่มีผู้ใช้ที่ถูกบล็อก")
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(10.))
+                                            .children(blocked.into_iter().map(|u| {
+                                                let uid = u.user_id.clone();
+                                                let name = u.display_name().to_string();
+                                                let official = u.is_official;
+                                                let uimg = u.profile_image.clone().and_then(|url| {
+                                                    self.store.update(cx, |s, cx| s.image(&url, cx))
+                                                });
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(10.))
+                                                    .child(avatar(uimg, 32., &p))
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(4.))
+                                                            .child(
+                                                                div()
+                                                                    .truncate()
+                                                                    .text_size(px(14.))
+                                                                    .text_color(p.ink)
+                                                                    .child(name),
+                                                            )
+                                                            .when(official, |d| {
+                                                                d.child(verified_badge(14., &p))
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "unblock-{uid}"
+                                                            )))
+                                                            .h(px(28.))
+                                                            .px(px(12.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .rounded(px(8.))
+                                                            .border_1()
+                                                            .border_color(p.hairline)
+                                                            .bg(p.surface_muted)
+                                                            .cursor_pointer()
+                                                            .text_size(px(12.))
+                                                            .text_color(p.ink)
+                                                            .hover(|s| s.bg(p.divider))
+                                                            .child("ปลดบล็อก")
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    let id = uid.clone();
+                                                                    this.store.update(cx, |s, cx| {
+                                                                        s.unblock_user(id, cx);
+                                                                    });
+                                                                },
+                                                            )),
+                                                    )
+                                            }))
+                                            .into_any_element()
+                                    }
+                                }),
+                            )
                             .child(Self::section("พื้นที่จัดเก็บข้อมูลบนเครื่อง", &p).child({
                                 let stats = crate::cache::inspect(&crate::env::data_dir());
                                 let db_size = crate::cache::format_bytes(stats.db_bytes);
                                 let media_size = crate::cache::format_bytes(stats.media_bytes);
                                 let log_size = crate::cache::format_bytes(stats.log_bytes);
-                                Self::row(
-                                    "ฐานข้อมูล แคชสื่อ และไฟล์ Log",
-                                    Some("ฐานข้อมูลแชทออฟไลน์ แคชรูปภาพ และบันทึกการทำงานบนเครื่อง"),
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(12.))
-                                        .child(
-                                            div()
-                                                .text_size(px(12.))
-                                                .text_color(p.ink_secondary)
-                                                .font_features(tnum())
-                                                .child(format!(
-                                                    "DB {db_size} · Media {media_size} · Log {log_size}"
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("clear-logs")
-                                                .h(px(28.))
-                                                .px(px(12.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(8.))
-                                                .border_1()
-                                                .border_color(p.hairline)
-                                                .bg(p.surface_muted)
-                                                .cursor_pointer()
-                                                .text_size(px(12.))
-                                                .text_color(p.ink)
-                                                .hover(|s| s.bg(p.divider))
-                                                .child("ล้างแคช / Log")
-                                                .on_click(cx.listener(|_, _, _, cx| {
-                                                    crate::cache::clear_old_logs(
-                                                        &crate::env::data_dir(),
-                                                    );
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                    &p,
-                                )
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(16.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(14.))
+                                                    .text_color(p.ink)
+                                                    .child("ฐานข้อมูล แคชสื่อ และไฟล์ Log"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(p.ink_subtitle)
+                                                    .font_features(tnum())
+                                                    .child(format!(
+                                                        "DB {db_size} · Media {media_size} · Log {log_size}"
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("clear-logs")
+                                            .flex_none()
+                                            .h(px(30.))
+                                            .px(px(14.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(8.))
+                                            .border_1()
+                                            .border_color(p.hairline)
+                                            .bg(p.surface_muted)
+                                            .cursor_pointer()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(p.ink)
+                                            .hover(|s| s.bg(p.divider))
+                                            .child("ล้างแคช")
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                crate::cache::clear_old_logs(
+                                                    &crate::env::data_dir(),
+                                                );
+                                                cx.notify();
+                                            })),
+                                    )
                             }))
                             .child(
                                 div()

@@ -20,6 +20,11 @@ pub fn icon(name: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(name).size(px(size)).text_color(color)
 }
 
+/// Verified / official account badge icon (`BadgeCheck`).
+pub fn verified_badge(size: f32, p: &Palette) -> Icon {
+    icon(IconName::BadgeCheck, size, p.primary_ink)
+}
+
 /// Circle avatar: the image once it has loaded, a quiet person glyph until then.
 pub fn avatar(image: Option<Arc<Image>>, size: f32, p: &Palette) -> AnyElement {
     let base = div()

@@ -1,6 +1,7 @@
 //! Root view: picks the screen (login, chat shell, settings), keeps the theme
 //! in step with the setting, and shows toasts and system notifications.
 
+mod emoji;
 mod login;
 mod room;
 mod settings;
@@ -17,7 +18,7 @@ use gpui_kit::*;
 use crate::{
     store::{Phase, Store, StoreEvent},
     theme::{self, Palette, PaletteExt},
-    ui::widgets::icon,
+    ui::widgets::{drag_region, icon},
 };
 use login::LoginView;
 use settings::{SettingsEvent, SettingsView};
@@ -200,7 +201,12 @@ impl Render for PintoApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(img("images/logo.png").size(px(56.)).opacity(0.9))
+                .child(
+                    img("images/logo.png")
+                        .size(px(56.))
+                        .rounded(px(14.))
+                        .opacity(0.9),
+                )
                 .into_any_element(),
             Screen::Login(v) => v.clone().into_any_element(),
             Screen::Shell {
@@ -211,14 +217,16 @@ impl Render for PintoApp {
         div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .bg(p.background)
             .text_color(p.ink)
             .font_family(theme::FONT_FAMILY)
             .text_size(px(14.))
-            .child(body)
             .when(cfg!(target_os = "windows"), |d| {
-                d.child(windows_caption_buttons(window, &p))
+                d.child(windows_titlebar(window, &p))
             })
+            .child(div().flex_1().min_h_0().w_full().child(body))
             .when_some(self.toast.clone(), |d, text| {
                 d.child(
                     div()
@@ -250,8 +258,9 @@ impl Render for PintoApp {
     }
 }
 
-/// Windows caption controls (Minimize, Maximize/Restore, Close) in the top-right corner.
-fn windows_caption_buttons(window: &Window, p: &Palette) -> impl IntoElement {
+/// Dedicated thin Windows title bar above the app content so caption controls
+/// sit at the very top edge and never collide with the room header's `...` menu.
+fn windows_titlebar(window: &Window, p: &Palette) -> impl IntoElement {
     let hover_bg = p.surface_muted;
     let max_icon = if window.is_maximized() {
         IconName::Copy
@@ -260,51 +269,60 @@ fn windows_caption_buttons(window: &Window, p: &Palette) -> impl IntoElement {
     };
 
     div()
-        .absolute()
-        .top_0()
-        .right_0()
+        .h(px(28.))
+        .w_full()
+        .flex_none()
+        .bg(p.surface)
+        .border_b_1()
+        .border_color(p.hairline)
         .flex()
         .items_center()
+        .child(drag_region(div().flex_1().h_full()))
         .child(
             div()
-                .id("win-min")
-                .w(px(36.))
-                .h(px(32.))
                 .flex()
                 .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .window_control_area(WindowControlArea::Min)
-                .hover(move |s| s.bg(hover_bg))
-                .child(icon(IconName::Minus, 14., p.ink_secondary))
-                .on_click(|_, window, _| window.minimize_window()),
-        )
-        .child(
-            div()
-                .id("win-max")
-                .w(px(36.))
-                .h(px(32.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .window_control_area(WindowControlArea::Max)
-                .hover(move |s| s.bg(hover_bg))
-                .child(icon(max_icon, 12., p.ink_secondary))
-                .on_click(|_, window, _| window.zoom_window()),
-        )
-        .child(
-            div()
-                .id("win-close")
-                .w(px(36.))
-                .h(px(32.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .window_control_area(WindowControlArea::Close)
-                .hover(|s| s.bg(rgb(0xE81123)).text_color(white()))
-                .child(icon(IconName::X, 14., p.ink_secondary))
-                .on_click(|_, _, cx| cx.quit()),
+                .child(
+                    div()
+                        .id("win-min")
+                        .w(px(36.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .window_control_area(WindowControlArea::Min)
+                        .hover(move |s| s.bg(hover_bg))
+                        .child(icon(IconName::Minus, 13., p.ink_secondary))
+                        .on_click(|_, window, _| window.minimize_window()),
+                )
+                .child(
+                    div()
+                        .id("win-max")
+                        .w(px(36.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .window_control_area(WindowControlArea::Max)
+                        .hover(move |s| s.bg(hover_bg))
+                        .child(icon(max_icon, 11., p.ink_secondary))
+                        .on_click(|_, window, _| window.zoom_window()),
+                )
+                .child(
+                    div()
+                        .id("win-close")
+                        .w(px(36.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .window_control_area(WindowControlArea::Close)
+                        .hover(|s| s.bg(rgb(0xE81123)).text_color(white()))
+                        .child(icon(IconName::X, 13., p.ink_secondary))
+                        .on_click(|_, _, cx| cx.quit()),
+                ),
         )
 }

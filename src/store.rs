@@ -60,6 +60,25 @@ pub enum RemoteImage {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatFilter {
+    #[default]
+    All,
+    Direct,
+    Group,
+    Bot,
+}
+
+impl ChatFilter {
+    pub fn api_chat_type(self) -> Option<ChatType> {
+        match self {
+            Self::All | Self::Bot => None,
+            Self::Direct => Some(ChatType::Direct),
+            Self::Group => Some(ChatType::Group),
+        }
+    }
+}
+
 pub struct Store {
     pub env: Env,
     api: Api,
@@ -73,7 +92,8 @@ pub struct Store {
 
     chats: HashMap<String, Chat>,
     pub selected_chat: Option<String>,
-    pub filter: Option<ChatType>,
+    pub filter: ChatFilter,
+    pub show_archived: bool,
     pub search: String,
     chat_page: usize,
     pub chats_loading: bool,
@@ -82,6 +102,9 @@ pub struct Store {
     /// People you follow, loaded when the friends list is first opened.
     pub friends: Vec<UserProfile>,
     pub friends_loading: bool,
+    pub blocked_users: Vec<UserProfile>,
+    pub blocked_ids: HashSet<String>,
+    pub blocked_loading: bool,
     /// Results of the find-people search.
     pub people: Vec<UserProfile>,
     pub people_query: String,
@@ -148,7 +171,8 @@ impl Store {
             auth_error: None,
             chats: HashMap::new(),
             selected_chat: None,
-            filter: None,
+            filter: ChatFilter::All,
+            show_archived: false,
             search: String::new(),
             chat_page: 1,
             chats_loading: false,
@@ -156,6 +180,9 @@ impl Store {
             chats_has_more: true,
             friends: Vec::new(),
             friends_loading: false,
+            blocked_users: Vec::new(),
+            blocked_ids: HashSet::new(),
+            blocked_loading: false,
             people: Vec::new(),
             people_query: String::new(),
             people_loading: false,
@@ -297,6 +324,7 @@ impl Store {
         self.load_cached_chats();
         self.prefetch_top_chats(cx);
         self.load_chats(true, cx);
+        self.load_blocked_users(cx);
         self.connect_socket(cx);
         self.flush_outbox(cx);
         cx.emit(StoreEvent::SignedIn);
@@ -540,7 +568,11 @@ impl Store {
         cx.notify();
 
         let api = self.api.clone();
-        let (page, q, kind) = (self.chat_page, self.search.clone(), self.filter);
+        let (page, q, kind) = (
+            self.chat_page,
+            self.search.clone(),
+            self.filter.api_chat_type(),
+        );
         let epoch = self.search_epoch;
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -576,7 +608,7 @@ impl Store {
                         {
                             log::warn!("cache chats: {e:#}");
                         }
-                        if reset && (!this.search.is_empty() || this.filter.is_some()) {
+                        if reset && !this.search.is_empty() {
                             this.chats.clear();
                         }
                         this.chats_has_more = chats.len() == CHAT_PAGE_SIZE;
@@ -604,7 +636,21 @@ impl Store {
             .chats
             .values()
             .filter(|c| !c.is_deleted)
-            .filter(|c| self.filter.is_none_or(|f| c.chat_type == f))
+            .filter(|c| {
+                if !q.is_empty() {
+                    true
+                } else if self.show_archived {
+                    c.is_archived
+                } else {
+                    !c.is_archived
+                }
+            })
+            .filter(|c| match self.filter {
+                ChatFilter::All => true,
+                ChatFilter::Direct => c.chat_type == ChatType::Direct,
+                ChatFilter::Group => c.chat_type == ChatType::Group,
+                ChatFilter::Bot => self.is_chat_bot(c),
+            })
             .filter(|c| {
                 q.is_empty()
                     || c.display_name().to_lowercase().contains(&q)
@@ -642,13 +688,17 @@ impl Store {
         self.typing.contains(chat_id)
     }
 
-    pub fn set_filter(&mut self, filter: Option<ChatType>, cx: &mut Context<Self>) {
+    pub fn set_filter(&mut self, filter: ChatFilter, cx: &mut Context<Self>) {
         if self.filter == filter {
             return;
         }
         self.filter = filter;
-        self.search_epoch += 1;
-        self.load_chats(true, cx);
+        if self.chats.is_empty() {
+            self.search_epoch += 1;
+            self.load_chats(true, cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// Debounced in the view; this runs the query.
@@ -658,7 +708,7 @@ impl Store {
         }
         self.search = q;
         self.search_epoch += 1;
-        if self.search.is_empty() && self.filter.is_none() {
+        if self.search.is_empty() && self.filter == ChatFilter::All {
             self.load_cached_chats();
         }
         self.load_chats(true, cx);
@@ -673,8 +723,44 @@ impl Store {
             self.load_pin(&id);
             self.load_messages(&id, cx);
             self.mark_read(&id, cx);
+            if self
+                .chats
+                .get(&id)
+                .is_some_and(|c| c.chat_type == ChatType::Group)
+            {
+                self.load_chat_detail(&id, cx);
+            }
         }
         cx.notify();
+    }
+
+    pub fn load_chat_detail(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.phase != Phase::SignedIn {
+            return;
+        }
+        let api = self.api.clone();
+        let id = chat_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let fetch_id = id.clone();
+            let res = cx
+                .background_spawn(async move { api.chat_detail(&fetch_id) })
+                .await;
+            if let Ok(mut fresh) = res {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(old) = this.chats.get(&id) {
+                        fresh.is_pinned = old.is_pinned;
+                        fresh.is_muted = old.is_muted;
+                        fresh.is_archived = old.is_archived;
+                    }
+                    if let Some(db) = this.db() {
+                        let _ = db.upsert_chats(std::slice::from_ref(&fresh));
+                    }
+                    this.chats.insert(id, fresh);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// Some direct chats arrive with an empty participant name. Look the
@@ -719,6 +805,105 @@ impl Store {
                     return;
                 }
             }
+        })
+        .detach();
+    }
+
+    // ---- blocks ---------------------------------------------------------
+
+    pub fn is_chat_official(&self, chat: &Chat) -> bool {
+        let me = self.user.as_ref().map(|u| u.user_id.as_str()).unwrap_or("");
+        chat.partner_is_official(me)
+    }
+
+    pub fn is_chat_bot(&self, chat: &Chat) -> bool {
+        let me = self.user.as_ref().map(|u| u.user_id.as_str()).unwrap_or("");
+        chat.partner_is_bot(me)
+    }
+
+    pub fn selected_partner_id(&self) -> Option<String> {
+        let me = self.user.as_ref()?.user_id.as_str();
+        self.selected()?.partner_id(me)
+    }
+
+    pub fn is_blocked(&self, user_id: &str) -> bool {
+        self.blocked_ids.contains(user_id)
+    }
+
+    pub fn load_blocked_users(&mut self, cx: &mut Context<Self>) {
+        if self.blocked_loading {
+            return;
+        }
+        self.blocked_loading = true;
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut all = Vec::new();
+                    let mut page = 1;
+                    loop {
+                        let (list, pages) = api.blocked_users(page, 50)?;
+                        let done = list.is_empty() || page >= pages || all.len() >= 500;
+                        all.extend(list);
+                        if done {
+                            break;
+                        }
+                        page += 1;
+                    }
+                    Ok::<_, ApiError>(all)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.blocked_loading = false;
+                if let Ok(list) = result {
+                    this.blocked_ids = list.iter().map(|u| u.user_id.clone()).collect();
+                    this.blocked_users = list;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn block_user(&mut self, user_id: String, cx: &mut Context<Self>) {
+        let api = self.api.clone();
+        let uid = user_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.block_user(&uid) })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    this.blocked_ids.insert(user_id.clone());
+                    this.load_blocked_users(cx);
+                    cx.emit(StoreEvent::Toast("บล็อกผู้ใช้แล้ว".into()));
+                    cx.notify();
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("บล็อกไม่สำเร็จ: {e}").into())),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn unblock_user(&mut self, user_id: String, cx: &mut Context<Self>) {
+        let api = self.api.clone();
+        let uid = user_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.unblock_user(&uid) })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    this.blocked_ids.remove(&user_id);
+                    this.blocked_users.retain(|u| u.user_id != user_id);
+                    cx.emit(StoreEvent::Toast("ปลดบล็อกผู้ใช้แล้ว".into()));
+                    cx.notify();
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("ปลดบล็อกไม่สำเร็จ: {e}").into())),
+            })
+            .ok();
         })
         .detach();
     }
@@ -873,6 +1058,14 @@ impl Store {
         if let Some(db) = self.db() {
             let _ = db.set_chat_muted(chat_id, muted);
         }
+        let api = self.api.clone();
+        let id = chat_id.to_string();
+        cx.background_spawn(async move {
+            if let Err(e) = api.set_chat_mute(&id, muted, 0) {
+                log::warn!("set chat mute: {e}");
+            }
+        })
+        .detach();
         cx.emit(StoreEvent::Toast(
             if muted {
                 "ปิดเสียงแชทนี้แล้ว"
@@ -882,6 +1075,331 @@ impl Store {
             .into(),
         ));
         cx.notify();
+    }
+
+    /// `(count, comma-joined chat names, total unread)` for the Telegram-style Archived row.
+    pub fn archived_summary(&self) -> (usize, String, i64) {
+        let mut archived: Vec<&Chat> = self
+            .chats
+            .values()
+            .filter(|c| !c.is_deleted && c.is_archived)
+            .collect();
+        archived.sort_by(|a, b| b.last_message_at.cmp(&a.last_message_at));
+        let count = archived.len();
+        let unread: i64 = archived.iter().map(|c| c.unread_count).sum();
+        let names = archived
+            .iter()
+            .map(|c| c.display_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        (count, names, unread)
+    }
+
+    pub fn set_show_archived(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_archived != show {
+            self.show_archived = show;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_pin_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(chat_id) else {
+            return;
+        };
+        chat.is_pinned = !chat.is_pinned;
+        let pinned = chat.is_pinned;
+        if let Some(db) = self.db() {
+            let _ = db.set_chat_pinned(chat_id, pinned);
+        }
+        cx.emit(StoreEvent::Toast(
+            if pinned {
+                "ปักหมุดแชทแล้ว"
+            } else {
+                "เลิกปักหมุดแชทแล้ว"
+            }
+            .into(),
+        ));
+        cx.notify();
+    }
+
+    pub fn toggle_archive_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(chat_id) else {
+            return;
+        };
+        chat.is_archived = !chat.is_archived;
+        let archived = chat.is_archived;
+        if let Some(db) = self.db() {
+            let _ = db.set_chat_archived(chat_id, archived);
+        }
+        if archived && self.selected_chat.as_deref() == Some(chat_id) {
+            self.selected_chat = None;
+        }
+        cx.emit(StoreEvent::Toast(
+            if archived {
+                "เก็บแชทถาวรแล้ว"
+            } else {
+                "ย้ายออกจากที่เก็บถาวรแล้ว"
+            }
+            .into(),
+        ));
+        cx.notify();
+    }
+
+    pub fn toggle_unread_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let unread = self.chats.get(chat_id).map(|c| c.unread_count).unwrap_or(0);
+        if unread > 0 {
+            self.mark_read(chat_id, cx);
+        } else {
+            if let Some(chat) = self.chats.get_mut(chat_id) {
+                chat.unread_count = 1;
+            }
+            if let Some(db) = self.db() {
+                let _ = db.set_unread(chat_id, 1);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn clear_chat_history(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.messages.remove(chat_id);
+        self.chat_has_more.insert(chat_id.to_string(), false);
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            self.messages_has_more = false;
+        }
+        if let Some(chat) = self.chats.get_mut(chat_id) {
+            chat.last_message_preview = None;
+            chat.last_message_id = None;
+        }
+        if let Some(db) = self.db() {
+            let _ = db.clear_chat_history(chat_id);
+        }
+        cx.emit(StoreEvent::Toast("ล้างประวัติแชทแล้ว".into()));
+        cx.notify();
+    }
+
+    pub fn delete_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.chats.remove(chat_id);
+        self.messages.remove(chat_id);
+        self.prefetched_chats.remove(chat_id);
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            self.selected_chat = None;
+        }
+        if let Some(db) = self.db() {
+            let _ = db.delete_chat(chat_id);
+        }
+        let api = self.api.clone();
+        let id = chat_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.delete_chat(&id) })
+                .await;
+            let _ = this.update(cx, |_, cx| match res {
+                Ok(()) => cx.emit(StoreEvent::Toast("ลบแชทแล้ว".into())),
+                Err(e) => cx.emit(StoreEvent::Toast(format!("ลบแชทไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn my_group_role(&self, chat: &Chat) -> String {
+        let Some(me) = self.user.as_ref().map(|u| u.user_id.as_str()) else {
+            return "member".into();
+        };
+        chat.participants()
+            .into_iter()
+            .find(|p| p.user_id == me)
+            .map(|p| p.role)
+            .unwrap_or_else(|| "member".into())
+    }
+
+    fn apply_updated_chat(&mut self, chat: Chat, cx: &mut Context<Self>) {
+        if let Some(db) = self.db() {
+            let _ = db.upsert_chats(std::slice::from_ref(&chat));
+        }
+        self.chats.insert(chat.chat_id.clone(), chat);
+        cx.notify();
+    }
+
+    pub fn rename_group(&mut self, chat_id: String, name: String, cx: &mut Context<Self>) {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() || trimmed.chars().count() > 100 {
+            cx.emit(StoreEvent::Toast("ชื่อกลุ่มต้องมีความยาว 1–100 ตัวอักษร".into()));
+            return;
+        }
+        let api = self.api.clone();
+        let id = chat_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.rename_group(&id, &trimmed) })
+                .await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(chat) => {
+                    this.apply_updated_chat(chat, cx);
+                    cx.emit(StoreEvent::Toast("เปลี่ยนชื่อกลุ่มแล้ว".into()));
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("เปลี่ยนชื่อกลุ่มไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+    }
+
+    pub fn update_group_avatar(
+        &mut self,
+        chat_id: String,
+        file: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let api = self.api.clone();
+        let id = chat_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.update_group_avatar(&id, &file) })
+                .await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(chat) => {
+                    this.apply_updated_chat(chat, cx);
+                    cx.emit(StoreEvent::Toast("อัปเดตรูปกลุ่มแล้ว".into()));
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("อัปเดตรูปกลุ่มไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+    }
+
+    pub fn copy_group_invite(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let api = self.api.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.get_group_invite(&chat_id) })
+                .await;
+            let _ = this.update(cx, |_, cx| match res {
+                Ok(url) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                    cx.emit(StoreEvent::Toast("คัดลอกลิงก์เชิญกลุ่มแล้ว".into()));
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("สร้างลิงก์เชิญไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+    }
+
+    pub fn add_group_participants(
+        &mut self,
+        chat_id: String,
+        user_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if user_ids.is_empty() {
+            return;
+        }
+        let api = self.api.clone();
+        let id = chat_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.add_group_participants(&id, &user_ids) })
+                .await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    this.load_chat_detail(&chat_id, cx);
+                    cx.emit(StoreEvent::Toast("เพิ่มสมาชิกเข้ากลุ่มแล้ว".into()));
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("เพิ่มสมาชิกไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+    }
+
+    pub fn remove_group_participant(
+        &mut self,
+        chat_id: String,
+        user_id: String,
+        is_self: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let api = self.api.clone();
+        let id = chat_id.clone();
+        let uid = user_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.remove_group_participant(&id, &uid) })
+                .await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    if is_self {
+                        this.chats.remove(&chat_id);
+                        this.messages.remove(&chat_id);
+                        if this.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                            this.selected_chat = None;
+                        }
+                        if let Some(db) = this.db() {
+                            let _ = db.delete_chat(&chat_id);
+                        }
+                        cx.emit(StoreEvent::Toast("ออกจากกลุ่มแล้ว".into()));
+                        cx.notify();
+                    } else {
+                        this.load_chat_detail(&chat_id, cx);
+                        cx.emit(StoreEvent::Toast("นำสมาชิกออกจากกลุ่มแล้ว".into()));
+                    }
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("ดำเนินการไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+    }
+
+    pub fn update_participant_role(
+        &mut self,
+        chat_id: String,
+        user_id: String,
+        role: String,
+        cx: &mut Context<Self>,
+    ) {
+        let api = self.api.clone();
+        let id = chat_id.clone();
+        let uid = user_id.clone();
+        let r = role.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.update_participant_role(&id, &uid, &r) })
+                .await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    this.load_chat_detail(&chat_id, cx);
+                    let msg = if role == "admin" {
+                        "ตั้งเป็นแอดมินแล้ว"
+                    } else {
+                        "ลดสิทธิ์เป็นสมาชิกแล้ว"
+                    };
+                    cx.emit(StoreEvent::Toast(msg.into()));
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("เปลี่ยนสิทธิ์ไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
+    }
+
+    pub fn transfer_group_ownership(
+        &mut self,
+        chat_id: String,
+        new_owner_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let api = self.api.clone();
+        let id = chat_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_spawn(async move { api.transfer_group_ownership(&id, &new_owner_id) })
+                .await;
+            let _ = this.update(cx, |this, cx| match res {
+                Ok(()) => {
+                    this.load_chat_detail(&chat_id, cx);
+                    cx.emit(StoreEvent::Toast("โอนสิทธิ์เจ้าของกลุ่มแล้ว".into()));
+                }
+                Err(e) => cx.emit(StoreEvent::Toast(format!("โอนสิทธิ์ไม่สำเร็จ: {e}").into())),
+            });
+        })
+        .detach();
     }
 
     pub fn pinned_message(&self, chat_id: &str) -> Option<Message> {

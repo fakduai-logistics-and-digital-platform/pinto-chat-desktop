@@ -8,6 +8,7 @@ use gpui_kit::component::{
     Sizable,
     button::Button,
     input::{Input, InputEvent, InputState},
+    menu::{ContextMenuExt, PopupMenuItem},
     scroll::ScrollableElement,
     skeleton::Skeleton,
 };
@@ -17,12 +18,12 @@ use gpui_kit::*;
 use crate::{
     env::SEARCH_DEBOUNCE_MS,
     format,
-    models::{Chat, ChatType, UserProfile},
+    models::{Chat, UserProfile},
     store::Store,
     theme::{Palette, PaletteExt},
     ui::{
         room::RoomView,
-        widgets::{avatar, drag_region, icon, icon_button, tnum, unread_badge},
+        widgets::{avatar, drag_region, icon, icon_button, tnum, unread_badge, verified_badge},
     },
 };
 
@@ -414,12 +415,19 @@ impl ShellView {
                                 .flex_col()
                                 .child(
                                     div()
-                                        .truncate()
-                                        .text_size(px(14.))
-                                        .line_height(px(20.))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(p.ink)
-                                        .child(u.display_name().to_string()),
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(14.))
+                                                .line_height(px(20.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(p.ink)
+                                                .child(u.display_name().to_string()),
+                                        )
+                                        .when(u.is_official, |d| d.child(verified_badge(14., p))),
                                 )
                                 .when(!u.username.is_empty(), |d| {
                                     d.child(
@@ -798,7 +806,7 @@ impl ShellView {
         let filter = self.store.read(cx).filter;
         let tab = |id: &'static str,
                    label: &'static str,
-                   value: Option<ChatType>,
+                   value: crate::store::ChatFilter,
                    cx: &mut Context<Self>| {
             let active = filter == value;
             div()
@@ -838,9 +846,15 @@ impl ShellView {
             .px(px(16.))
             .border_b_1()
             .border_color(p.divider)
-            .child(tab("tab-all", "ทั้งหมด", None, cx))
-            .child(tab("tab-direct", "เพื่อน", Some(ChatType::Direct), cx))
-            .child(tab("tab-group", "กลุ่ม", Some(ChatType::Group), cx))
+            .child(tab("tab-all", "ทั้งหมด", crate::store::ChatFilter::All, cx))
+            .child(tab(
+                "tab-direct",
+                "เพื่อน",
+                crate::store::ChatFilter::Direct,
+                cx,
+            ))
+            .child(tab("tab-group", "กลุ่ม", crate::store::ChatFilter::Group, cx))
+            .child(tab("tab-bot", "บอท", crate::store::ChatFilter::Bot, cx))
     }
 
     fn render_row(
@@ -900,13 +914,25 @@ impl ShellView {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
-                                    .text_size(px(14.))
-                                    .line_height(px(20.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(p.ink)
-                                    .child(chat.display_name().to_string()),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(14.))
+                                            .line_height(px(20.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(p.ink)
+                                            .child(chat.display_name().to_string()),
+                                    )
+                                    .when(self.store.read(cx).is_chat_official(chat), |d| {
+                                        d.child(verified_badge(14., p))
+                                    }),
                             )
+                            .when(chat.is_pinned, |d| {
+                                d.child(icon(IconName::Pin, 12., p.primary_ink))
+                            })
                             .when(chat.is_muted, |d| {
                                 d.child(icon(IconName::BellOff, 12., p.ink_subtitle))
                             })
@@ -943,11 +969,109 @@ impl ShellView {
                             }),
                     ),
             )
+            .context_menu({
+                let shell = cx.entity().downgrade();
+                let chat_id = chat.chat_id.clone();
+                let archived = chat.is_archived;
+                let pinned = chat.is_pinned;
+                let muted = chat.is_muted;
+                let unread = chat.unread_count > 0;
+                move |menu, _, cx| {
+                    let pal = cx.palette();
+                    let row = move |label: &'static str, name: IconName, danger: bool| {
+                        let color = if danger { pal.error_strong } else { pal.ink };
+                        let icon_color = if danger {
+                            pal.error_strong
+                        } else {
+                            pal.ink_secondary
+                        };
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .text_color(color)
+                                .child(icon(name, 15., icon_color))
+                                .child(label)
+                        })
+                    };
+                    let act = |f: fn(&mut Store, &str, &mut Context<Store>)| {
+                        let shell = shell.clone();
+                        let cid = chat_id.clone();
+                        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                            let cid = cid.clone();
+                            let _ = shell.update(cx, |v, cx| {
+                                v.store.update(cx, |s, cx| f(s, &cid, cx));
+                            });
+                        }
+                    };
+                    menu.item(
+                        row(
+                            if archived {
+                                "ย้ายออกจากที่เก็บถาวร"
+                            } else {
+                                "เก็บถาวร (Archive)"
+                            },
+                            IconName::Archive,
+                            false,
+                        )
+                        .on_click(act(Store::toggle_archive_chat)),
+                    )
+                    .item(
+                        row(
+                            if pinned {
+                                "เลิกปักหมุด"
+                            } else {
+                                "ปักหมุด"
+                            },
+                            IconName::Pin,
+                            false,
+                        )
+                        .on_click(act(Store::toggle_pin_chat)),
+                    )
+                    .item(
+                        row(
+                            if muted {
+                                "เปิดเสียงแจ้งเตือน"
+                            } else {
+                                "ปิดเสียงแจ้งเตือน"
+                            },
+                            if muted {
+                                IconName::Bell
+                            } else {
+                                IconName::BellOff
+                            },
+                            false,
+                        )
+                        .on_click(act(Store::toggle_mute)),
+                    )
+                    .item(
+                        row(
+                            if unread {
+                                "ทำเครื่องหมายว่าอ่านแล้ว"
+                            } else {
+                                "ทำเครื่องหมายว่ายังไม่อ่าน"
+                            },
+                            IconName::MessageCircle,
+                            false,
+                        )
+                        .on_click(act(Store::toggle_unread_chat)),
+                    )
+                    .separator()
+                    .item(
+                        row("ล้างประวัติแชท", IconName::Eraser, false)
+                            .on_click(act(Store::clear_chat_history)),
+                    )
+                    .item(row("ลบแชท", IconName::Trash, true).on_click(act(Store::delete_chat)))
+                }
+            })
     }
 
     fn render_list(&self, cx: &mut Context<Self>, p: &Palette) -> AnyElement {
         let store = self.store.read(cx);
         let chats = store.sorted_chats();
+        let (archived_count, archived_names, archived_unread) = store.archived_summary();
+        let show_archived = store.show_archived;
         let selected = store.selected_chat.clone();
         let (loading, loading_more, has_more) = (
             store.chats_loading,
@@ -988,7 +1112,7 @@ impl ShellView {
                 .into_any_element();
         }
 
-        if chats.is_empty() {
+        if chats.is_empty() && archived_count == 0 {
             let (title, body) = if searching {
                 ("ไม่พบแชท".to_string(), format!("ไม่มีแชทที่ตรงกับ “{search}”"))
             } else {
@@ -1054,6 +1178,87 @@ impl ShellView {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.list_scroll)
+            .when(archived_count > 0 || show_archived, |d| {
+                let hover = p.surface_muted;
+                let avatar_sz = if compact { 36. } else { 44. };
+                d.child(
+                    div()
+                        .id("archived-toggle")
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(16.))
+                        .py(px(if compact { 6. } else { 10. }))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .child(
+                            div()
+                                .size(px(avatar_sz))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(p.surface_muted)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(
+                                    if show_archived {
+                                        IconName::ChevronLeft
+                                    } else {
+                                        IconName::Archive
+                                    },
+                                    18.,
+                                    p.ink_secondary,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .line_height(px(20.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(p.ink)
+                                        .child(if show_archived {
+                                            "กลับไปแชทหลัก"
+                                        } else {
+                                            "แชทที่เก็บถาวร"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(px(12.))
+                                                .line_height(px(18.))
+                                                .text_color(p.ink_secondary)
+                                                .child(if show_archived {
+                                                    format!("{archived_count} แชทที่เก็บถาวร")
+                                                } else {
+                                                    archived_names
+                                                }),
+                                        )
+                                        .when(!show_archived && archived_unread > 0, |d| {
+                                            d.child(unread_badge(archived_unread, p))
+                                        }),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.store
+                                .update(cx, |s, cx| s.set_show_archived(!show_archived, cx));
+                        })),
+                )
+            })
             .children(
                 chats
                     .iter()
