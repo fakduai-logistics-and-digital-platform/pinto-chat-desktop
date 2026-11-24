@@ -314,10 +314,11 @@ impl Render for SettingsView {
                             .child(Self::section("พื้นที่จัดเก็บข้อมูลบนเครื่อง", &p).child({
                                 let stats = crate::cache::inspect(&crate::env::data_dir());
                                 let db_size = crate::cache::format_bytes(stats.db_bytes);
+                                let media_size = crate::cache::format_bytes(stats.media_bytes);
                                 let log_size = crate::cache::format_bytes(stats.log_bytes);
                                 Self::row(
-                                    "ฐานข้อมูลและไฟล์ Log",
-                                    Some("ฐานข้อมูลแชทออฟไลน์และบันทึกการทำงานบนเครื่อง"),
+                                    "ฐานข้อมูล แคชสื่อ และไฟล์ Log",
+                                    Some("ฐานข้อมูลแชทออฟไลน์ แคชรูปภาพ และบันทึกการทำงานบนเครื่อง"),
                                     div()
                                         .flex()
                                         .items_center()
@@ -327,7 +328,9 @@ impl Render for SettingsView {
                                                 .text_size(px(12.))
                                                 .text_color(p.ink_secondary)
                                                 .font_features(tnum())
-                                                .child(format!("DB {db_size} · Log {log_size}")),
+                                                .child(format!(
+                                                    "DB {db_size} · Media {media_size} · Log {log_size}"
+                                                )),
                                         )
                                         .child(
                                             div()
@@ -344,7 +347,7 @@ impl Render for SettingsView {
                                                 .text_size(px(12.))
                                                 .text_color(p.ink)
                                                 .hover(|s| s.bg(p.divider))
-                                                .child("ล้าง Log เก่า")
+                                                .child("ล้างแคช / Log")
                                                 .on_click(cx.listener(|_, _, _, cx| {
                                                     crate::cache::clear_old_logs(
                                                         &crate::env::data_dir(),

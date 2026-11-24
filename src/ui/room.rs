@@ -1681,3 +1681,23 @@ impl Render for RoomView {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::animated_badge;
+    use crate::models::{Message, MessageType};
+
+    #[test]
+    fn detects_animated_gif_and_webp_badges() {
+        let mut msg = Message::temp("c1", "u1", "", MessageType::File, None);
+        msg.file_name = Some("party.GIF".into());
+        assert_eq!(animated_badge(&msg), Some("GIF"));
+
+        msg.file_name = None;
+        msg.media_url = Some("https://cdn.example.com/sticker.webp?v=2".into());
+        assert_eq!(animated_badge(&msg), Some("WEBP"));
+
+        msg.media_url = Some("https://cdn.example.com/photo.png".into());
+        assert_eq!(animated_badge(&msg), None);
+    }
+}

@@ -48,6 +48,11 @@ mod tests {
             parse("pinto://resolve?foo=1&chat=abc-99"),
             Some(DeepLink::OpenChat("abc-99".into()))
         );
+        assert_eq!(
+            parse("  pinto://chat/room-42/  "),
+            Some(DeepLink::OpenChat("room-42".into()))
+        );
+        assert_eq!(parse("pinto://resolve?chat="), None);
         assert_eq!(parse("pinto://chat/"), None);
         assert_eq!(parse("https://example.com"), None);
     }

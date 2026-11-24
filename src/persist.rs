@@ -99,11 +99,15 @@ pub struct WindowState {
 }
 
 impl WindowState {
+    fn is_valid(&self) -> bool {
+        self.width >= 460.0 && self.height >= 480.0 && self.x.is_finite() && self.y.is_finite()
+    }
+
     pub fn load() -> Option<Self> {
         let s: Option<Self> = std::fs::read_to_string(data_dir().join("window.json"))
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
-        s.filter(|w| w.width >= 460.0 && w.height >= 480.0 && w.x.is_finite() && w.y.is_finite())
+        s.filter(Self::is_valid)
     }
 
     pub fn save(&self) {
@@ -124,4 +128,57 @@ pub fn device_id() -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let _ = std::fs::write(&path, &id);
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_state_validates_bounds() {
+        assert!(
+            WindowState {
+                x: 100.0,
+                y: 80.0,
+                width: 1200.0,
+                height: 800.0
+            }
+            .is_valid()
+        );
+        assert!(
+            !WindowState {
+                x: 0.0,
+                y: 0.0,
+                width: 300.0,
+                height: 800.0
+            }
+            .is_valid()
+        );
+        assert!(
+            !WindowState {
+                x: f32::NAN,
+                y: 0.0,
+                width: 800.0,
+                height: 600.0
+            }
+            .is_valid()
+        );
+    }
+
+    #[test]
+    fn settings_roundtrip_json() {
+        let s = Settings {
+            wallpaper: Wallpaper::Plain,
+            theme: ThemeMode::Dark,
+            compact_mode: true,
+            notifications_enabled: false,
+            show_preview: false,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.theme, ThemeMode::Dark);
+        assert_eq!(parsed.wallpaper, Wallpaper::Plain);
+        assert!(parsed.compact_mode);
+        assert!(!parsed.notifications_enabled);
+    }
 }

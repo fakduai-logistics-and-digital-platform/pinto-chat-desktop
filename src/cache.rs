@@ -7,6 +7,7 @@ use std::{fs, path::Path};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StorageStats {
     pub db_bytes: u64,
+    pub media_bytes: u64,
     pub log_bytes: u64,
 }
 
@@ -31,21 +32,45 @@ fn dir_len(path: &Path) -> u64 {
         .sum()
 }
 
-/// Measure local SQLite database and log/crash-report disk usage in `data_dir`.
+/// Measure local SQLite database, media cache, and log/crash-report disk usage.
 pub fn inspect(data_dir: &Path) -> StorageStats {
     let db_bytes = file_len(&data_dir.join("pinto-chat.sqlite"))
         + file_len(&data_dir.join("pinto-chat.sqlite-wal"))
         + file_len(&data_dir.join("pinto-chat.sqlite-shm"));
+    let media_bytes = dir_len(&data_dir.join("media_cache"));
     let log_bytes = file_len(&data_dir.join("pinto-chat.log"))
         + file_len(&data_dir.join("pinto-chat.prev.log"))
         + dir_len(&data_dir.join("DebugLogs"));
     StorageStats {
         db_bytes,
+        media_bytes,
         log_bytes,
     }
 }
 
-/// Remove rotated logs and crash reports in `DebugLogs/`, returning freed bytes.
+fn cache_key(url: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in url.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Read cached image/media bytes from `data_dir/media_cache/`.
+pub fn read_cached_media(data_dir: &Path, url: &str) -> Option<Vec<u8>> {
+    fs::read(data_dir.join("media_cache").join(cache_key(url))).ok()
+}
+
+/// Persist downloaded image/media bytes to `data_dir/media_cache/`.
+pub fn write_cached_media(data_dir: &Path, url: &str, bytes: &[u8]) {
+    let dir = data_dir.join("media_cache");
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(dir.join(cache_key(url)), bytes);
+    }
+}
+
+/// Remove rotated logs, crash reports, and cached media, returning freed bytes.
 pub fn clear_old_logs(data_dir: &Path) -> u64 {
     let mut freed = 0u64;
     let prev = data_dir.join("pinto-chat.prev.log");
@@ -54,13 +79,15 @@ pub fn clear_old_logs(data_dir: &Path) -> u64 {
         freed = freed.saturating_add(prev_len);
     }
 
-    let debug_dir = data_dir.join("DebugLogs");
-    if let Ok(entries) = fs::read_dir(&debug_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let len = file_len(&p);
-            if p.is_file() && fs::remove_file(&p).is_ok() {
-                freed = freed.saturating_add(len);
+    for sub in ["DebugLogs", "media_cache"] {
+        let dir = data_dir.join(sub);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let len = file_len(&p);
+                if p.is_file() && fs::remove_file(&p).is_ok() {
+                    freed = freed.saturating_add(len);
+                }
             }
         }
     }
@@ -99,10 +126,18 @@ mod tests {
         assert_eq!(stats.db_bytes, 1024);
         assert_eq!(stats.log_bytes, 768);
 
+        write_cached_media(&dir, "https://cdn.example.com/a.png", b"imgbytes");
+        assert_eq!(
+            read_cached_media(&dir, "https://cdn.example.com/a.png").as_deref(),
+            Some(&b"imgbytes"[..])
+        );
+        assert_eq!(inspect(&dir).media_bytes, 8);
+
         let freed = clear_old_logs(&dir);
-        assert_eq!(freed, 768);
+        assert_eq!(freed, 776);
         assert!(dir.join("pinto-chat.sqlite").exists());
         assert_eq!(inspect(&dir).log_bytes, 0);
+        assert_eq!(inspect(&dir).media_bytes, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -90,3 +90,31 @@ pub fn data_dir() -> PathBuf {
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_http_urls_to_ws() {
+        assert_eq!(
+            http_to_ws("https://api.pinto-app.com"),
+            "wss://api.pinto-app.com"
+        );
+        assert_eq!(http_to_ws("http://localhost:8080"), "ws://localhost:8080");
+        assert_eq!(http_to_ws("wss://already.ws"), "wss://already.ws");
+    }
+
+    #[test]
+    fn builds_encoded_chat_ws_url() {
+        let env = Env {
+            api_base_url: "https://api.pinto-app.com".into(),
+            ws_base_url: "wss://api.pinto-app.com".into(),
+            qr_auth_ws_url: "wss://api.pinto-app.com/ws/auth/qr".into(),
+        };
+        assert_eq!(
+            env.chat_ws_url("a+b/c="),
+            "wss://api.pinto-app.com/v1/ws/chat?token=a%2Bb%2Fc%3D"
+        );
+    }
+}

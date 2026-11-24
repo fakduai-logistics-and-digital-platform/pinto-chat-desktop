@@ -96,6 +96,7 @@ pub struct Store {
 
     messages: HashMap<String, Vec<Message>>,
     chat_has_more: HashMap<String, bool>,
+    prefetched_chats: HashSet<String>,
     pub messages_loading: bool,
     pub messages_loading_more: bool,
     pub messages_has_more: bool,
@@ -166,6 +167,7 @@ impl Store {
             typing_epoch: HashMap::new(),
             messages: HashMap::new(),
             chat_has_more: HashMap::new(),
+            prefetched_chats: HashSet::new(),
             messages_loading: false,
             messages_loading_more: false,
             messages_has_more: true,
@@ -293,6 +295,7 @@ impl Store {
         self.user = Some(user);
         self.phase = Phase::SignedIn;
         self.load_cached_chats();
+        self.prefetch_top_chats(cx);
         self.load_chats(true, cx);
         self.connect_socket(cx);
         self.flush_outbox(cx);
@@ -582,6 +585,7 @@ impl Store {
                         }
                         this.chat_page += 1;
                         this.resolve_unnamed_chats(cx);
+                        this.prefetch_top_chats(cx);
                     }
                     Err(e) => log::warn!("load chats: {e}"),
                 }
@@ -1077,7 +1081,117 @@ impl Store {
             .unwrap_or_else(|| "ไม่ทราบชื่อ".into())
     }
 
-    /// In-memory cache first, then SQLite, then API only when empty.
+    /// Preload the top chats' latest messages in the background (SQLite first,
+    /// API fallback for uncached top chats) so switching rooms is instant even
+    /// on the very first click, matching Telegram Desktop's preload behavior.
+    fn prefetch_top_chats(&mut self, cx: &mut Context<Self>) {
+        if self.phase != Phase::SignedIn {
+            return;
+        }
+        let todo_items: Vec<(String, Option<String>)> = self
+            .sorted_chats()
+            .into_iter()
+            .take(8)
+            .filter(|c| {
+                !self.messages.contains_key(&c.chat_id)
+                    && !self.prefetched_chats.contains(&c.chat_id)
+            })
+            .map(|c| (c.chat_id, c.avatar_url))
+            .collect();
+        if todo_items.is_empty() {
+            return;
+        }
+        let mut todo = Vec::with_capacity(todo_items.len());
+        for (id, avatar) in todo_items {
+            self.prefetched_chats.insert(id.clone());
+            self.load_pin(&id);
+            if let Some(url) = avatar {
+                let _ = self.image(&url, cx);
+            }
+            todo.push(id);
+        }
+
+        let api = self.api.clone();
+        let db_path = crate::env::data_dir().join("pinto-chat.sqlite");
+        cx.spawn(async move |this, cx| {
+            let mut api_budget = 5usize;
+            for chat_id in todo {
+                let already_loaded = this
+                    .read_with(cx, |this, _| this.messages.contains_key(&chat_id))
+                    .unwrap_or(true);
+                if already_loaded {
+                    continue;
+                }
+                let id_for_db = chat_id.clone();
+                let path = db_path.clone();
+                let local = cx
+                    .background_spawn(async move {
+                        Db::open(&path)
+                            .ok()
+                            .and_then(|d| d.messages(&id_for_db, MESSAGE_PAGE_SIZE, None).ok())
+                            .unwrap_or_default()
+                    })
+                    .await;
+
+                if !local.is_empty() {
+                    let has_more = local.len() == MESSAGE_PAGE_SIZE;
+                    let _ = this.update(cx, |this, _| {
+                        if !this.messages.contains_key(&chat_id) {
+                            this.chat_has_more.insert(chat_id.clone(), has_more);
+                            this.messages
+                                .insert(chat_id, local.into_iter().rev().collect());
+                        }
+                    });
+                    continue;
+                }
+
+                if api_budget == 0 {
+                    continue;
+                }
+                api_budget -= 1;
+
+                let api = api.clone();
+                let fetch_id = chat_id.clone();
+                let fetched = cx
+                    .background_spawn(
+                        async move { api.legacy_history(&fetch_id, MESSAGE_PAGE_SIZE) },
+                    )
+                    .await;
+                if let Ok(rows) = fetched {
+                    let mut list: Vec<Message> = rows
+                        .iter()
+                        .map(|raw| {
+                            let mut m = Message::from_value(raw);
+                            if m.chat_id.is_empty() {
+                                m.chat_id = chat_id.clone();
+                            }
+                            m
+                        })
+                        .collect();
+                    list.sort_by_key(|m| crate::models::parse_time(&m.created_at));
+                    let has_more = list.len() == MESSAGE_PAGE_SIZE;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(db) = this.db() {
+                            for m in &list {
+                                let _ = db.upsert_message(m);
+                            }
+                        }
+                        if !this.messages.contains_key(&chat_id) {
+                            this.chat_has_more.insert(chat_id.clone(), has_more);
+                            this.messages.insert(chat_id.clone(), list);
+                            if this.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                                cx.emit(StoreEvent::MessagesAppended);
+                            }
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Local rows first; only an empty cache goes to the API.
     fn load_messages(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         if self
             .messages
@@ -1716,10 +1830,18 @@ impl Store {
         self.images.insert(url.to_string(), RemoteImage::Loading);
         let api = self.api.clone();
         let key = url.to_string();
+        let cache_dir = crate::env::data_dir();
         cx.spawn(async move |this, cx| {
             let url = key.clone();
             let result = cx
-                .background_spawn(async move { api.fetch_bytes(&url) })
+                .background_spawn(async move {
+                    if let Some(cached) = crate::cache::read_cached_media(&cache_dir, &url) {
+                        return Ok(cached);
+                    }
+                    let bytes = api.fetch_bytes(&url)?;
+                    crate::cache::write_cached_media(&cache_dir, &url, &bytes);
+                    Ok::<_, crate::api::ApiError>(bytes)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 let state = match result.ok().and_then(|bytes| Some((sniff(&bytes)?, bytes))) {
@@ -1751,5 +1873,23 @@ fn sniff(b: &[u8]) -> Option<ImageFormat> {
         Some(ImageFormat::Svg)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ImageFormat, sniff};
+
+    #[test]
+    fn sniffs_supported_image_formats() {
+        assert_eq!(sniff(b"\x89PNG\r\n\x1a\n"), Some(ImageFormat::Png));
+        assert_eq!(sniff(b"\xFF\xD8\xFF\xE0"), Some(ImageFormat::Jpeg));
+        assert_eq!(sniff(b"GIF89a..."), Some(ImageFormat::Gif));
+        assert_eq!(
+            sniff(b"RIFF\x00\x00\x00\x00WEBPextra"),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(sniff(b"<svg xmlns='x'>"), Some(ImageFormat::Svg));
+        assert_eq!(sniff(b"not-an-image"), None);
     }
 }
