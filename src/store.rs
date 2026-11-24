@@ -95,6 +95,7 @@ pub struct Store {
     typing_epoch: HashMap<String, u64>,
 
     messages: HashMap<String, Vec<Message>>,
+    chat_has_more: HashMap<String, bool>,
     pub messages_loading: bool,
     pub messages_loading_more: bool,
     pub messages_has_more: bool,
@@ -164,6 +165,7 @@ impl Store {
             typing: HashSet::new(),
             typing_epoch: HashMap::new(),
             messages: HashMap::new(),
+            chat_has_more: HashMap::new(),
             messages_loading: false,
             messages_loading_more: false,
             messages_has_more: true,
@@ -1075,15 +1077,27 @@ impl Store {
             .unwrap_or_else(|| "ไม่ทราบชื่อ".into())
     }
 
-    /// Local rows first; only an empty cache goes to the API.
+    /// In-memory cache first, then SQLite, then API only when empty.
     fn load_messages(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self
+            .messages
+            .get(chat_id)
+            .is_some_and(|list| !list.is_empty())
+        {
+            self.messages_loading = false;
+            self.messages_has_more = self.chat_has_more.get(chat_id).copied().unwrap_or(true);
+            cx.notify();
+            return;
+        }
         self.messages_has_more = true;
         let local = self
             .db()
             .and_then(|db| db.messages(chat_id, MESSAGE_PAGE_SIZE, None).ok())
             .unwrap_or_default();
         if !local.is_empty() {
-            self.messages_has_more = local.len() == MESSAGE_PAGE_SIZE;
+            let has_more = local.len() == MESSAGE_PAGE_SIZE;
+            self.chat_has_more.insert(chat_id.to_string(), has_more);
+            self.messages_has_more = has_more;
             self.messages
                 .insert(chat_id.to_string(), local.into_iter().rev().collect());
             cx.emit(StoreEvent::MessagesAppended);
@@ -1118,7 +1132,9 @@ impl Store {
                                 let _ = db.upsert_message(m);
                             }
                         }
-                        this.messages_has_more = list.len() == MESSAGE_PAGE_SIZE;
+                        let has_more = list.len() == MESSAGE_PAGE_SIZE;
+                        this.chat_has_more.insert(id.clone(), has_more);
+                        this.messages_has_more = has_more;
                         list.sort_by_key(|m| crate::models::parse_time(&m.created_at));
                         this.messages.insert(id.clone(), list);
                         cx.emit(StoreEvent::MessagesAppended);
@@ -1143,7 +1159,9 @@ impl Store {
             .db()
             .and_then(|db| db.messages(chat_id, MESSAGE_PAGE_SIZE, Some(&oldest)).ok())
             .unwrap_or_default();
-        self.messages_has_more = older.len() == MESSAGE_PAGE_SIZE;
+        let has_more = older.len() == MESSAGE_PAGE_SIZE;
+        self.chat_has_more.insert(chat_id.to_string(), has_more);
+        self.messages_has_more = has_more;
         if !older.is_empty() {
             let list = self.messages.entry(chat_id.to_string()).or_default();
             let mut merged: Vec<Message> = older.into_iter().rev().collect();

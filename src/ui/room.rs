@@ -48,6 +48,21 @@ impl MediaTab {
 /// Dark ink on the brand green keeps message text above 4.5:1.
 const ON_BUBBLE: u32 = 0x10281A;
 
+/// Detect animated GIF / WebP attachments sent as `File` or `Image` messages.
+fn animated_badge(m: &Message) -> Option<&'static str> {
+    let candidates = [m.file_name.as_deref(), m.media_url.as_deref()];
+    for raw in candidates.into_iter().flatten() {
+        let clean = raw.split('?').next().unwrap_or(raw).to_ascii_lowercase();
+        if clean.ends_with(".gif") {
+            return Some("GIF");
+        }
+        if clean.ends_with(".webp") {
+            return Some("WEBP");
+        }
+    }
+    None
+}
+
 pub struct RoomView {
     store: Entity<Store>,
     composer: Entity<InputState>,
@@ -58,7 +73,10 @@ pub struct RoomView {
     /// Set while older messages load, to keep the reading position.
     anchor: Option<Pixels>,
     last_chat: Option<String>,
+    room_epoch: u64,
     panel: Option<MediaTab>,
+    drafts: std::collections::HashMap<String, (String, Option<ReplyTarget>)>,
+    scroll_states: std::collections::HashMap<String, (bool, Point<Pixels>)>,
 }
 
 impl RoomView {
@@ -87,8 +105,15 @@ impl RoomView {
             window,
             |this, store, ev: &StoreEvent, window, cx| {
                 if let StoreEvent::MessagesAppended = ev {
-                    let changed = store.read(cx).selected_chat != this.last_chat;
-                    if changed || this.stick_to_bottom || this.distance_from_bottom() < px(300.) {
+                    let selected = store.read(cx).selected_chat.as_deref();
+                    let changed = selected != this.last_chat.as_deref();
+                    let saved_scrolled_up = selected
+                        .and_then(|id| this.scroll_states.get(id))
+                        .is_some_and(|(at_bottom, _)| !*at_bottom);
+                    if (changed && !saved_scrolled_up)
+                        || (!changed
+                            && (this.stick_to_bottom || this.distance_from_bottom() < px(300.)))
+                    {
                         this.scroll_to_bottom(window, cx);
                     }
                 }
@@ -98,15 +123,45 @@ impl RoomView {
         cx.observe_in(&store, window, |this, store, window, cx| {
             let selected = store.read(cx).selected_chat.clone();
             if selected != this.last_chat {
-                // Switching chats closes the panel; the first open keeps it.
-                if this.last_chat.is_some() {
+                if let Some(prev) = this.last_chat.take() {
+                    let draft_text = this.composer.read(cx).value().to_string();
+                    if draft_text.is_empty() && this.reply.is_none() {
+                        this.drafts.remove(&prev);
+                    } else {
+                        this.drafts
+                            .insert(prev.clone(), (draft_text, this.reply.clone()));
+                    }
+                    let at_bottom = this.stick_to_bottom || this.distance_from_bottom() < px(8.);
+                    this.scroll_states
+                        .insert(prev, (at_bottom, this.scroll.offset()));
+                    // Switching chats closes the panel; the first open keeps it.
                     this.panel = None;
                 }
-                this.last_chat = selected;
-                this.reply = None;
-                this.composer
-                    .update(cx, |s, cx| s.set_value("", window, cx));
-                this.scroll_to_bottom(window, cx);
+                this.last_chat = selected.clone();
+                this.room_epoch += 1;
+                if let Some(id) = selected.as_deref() {
+                    let (draft_text, reply) = this
+                        .drafts
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), None));
+                    this.reply = reply;
+                    this.composer
+                        .update(cx, |s, cx| s.set_value(draft_text, window, cx));
+                    if let Some(&(false, offset)) = this.scroll_states.get(id) {
+                        this.stick_to_bottom = false;
+                        this.scroll.set_offset(offset);
+                        let handle = this.scroll.clone();
+                        window.on_next_frame(move |_, _| handle.set_offset(offset));
+                    } else {
+                        this.scroll_to_bottom(window, cx);
+                    }
+                } else {
+                    this.reply = None;
+                    this.composer
+                        .update(cx, |s, cx| s.set_value("", window, cx));
+                    this.scroll_to_bottom(window, cx);
+                }
             }
             cx.notify();
         })
@@ -120,9 +175,12 @@ impl RoomView {
             stick_to_bottom: true,
             anchor: None,
             last_chat: None,
+            room_epoch: 0,
             panel: (cfg!(debug_assertions)
                 && std::env::var("PINTO_PREVIEW").is_ok_and(|v| v.contains("panel")))
             .then_some(MediaTab::Files),
+            drafts: std::collections::HashMap::new(),
+            scroll_states: std::collections::HashMap::new(),
         }
     }
 
@@ -799,6 +857,7 @@ impl RoomView {
             .items_center()
             .gap(px(12.))
             .px(px(16.))
+            .when(cfg!(target_os = "windows"), |d| d.pr(px(124.)))
             .bg(p.surface)
             .border_b_1()
             .border_color(p.divider)
@@ -1021,7 +1080,10 @@ impl RoomView {
             .then_some(sender_avatar)
             .flatten()
             .and_then(|u| self.store.update(cx, |s, cx| s.image(&u, cx)));
-        let media = (m.message_type == MessageType::Image)
+        let anim_badge = animated_badge(m);
+        let is_visual_media = m.message_type == MessageType::Image
+            || (m.message_type == MessageType::File && anim_badge.is_some());
+        let media = is_visual_media
             .then(|| m.media_url.clone())
             .flatten()
             .and_then(|u| self.store.update(cx, |s, cx| s.image(&u, cx)));
@@ -1086,62 +1148,78 @@ impl RoomView {
                     .child(div().truncate().text_color(meta).child(what)),
             );
         }
-        match m.message_type {
-            MessageType::Image => {
-                bubble = bubble.child(match media {
-                    Some(img_data) => img(img_data)
-                        .max_w(px(280.))
-                        .max_h(px(320.))
-                        .rounded(px(8.))
-                        .into_any_element(),
-                    None => div()
-                        .w(px(220.))
-                        .h(px(140.))
-                        .rounded(px(8.))
-                        .bg(if own {
-                            fg.opacity(0.1)
-                        } else {
-                            p.surface_muted
-                        })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(icon(IconName::Image, 24., meta))
-                        .into_any_element(),
-                });
-            }
-            MessageType::File => {
-                bubble = bubble.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .p(px(8.))
-                        .rounded(px(8.))
-                        .bg(if own {
-                            fg.opacity(0.08)
-                        } else {
-                            p.surface_muted
-                        })
-                        .child(icon(IconName::File, 16., fg))
-                        .child(
+        if is_visual_media {
+            bubble = bubble.child(match media {
+                Some(img_data) => div()
+                    .relative()
+                    .child(
+                        img(img_data)
+                            .max_w(px(280.))
+                            .max_h(px(320.))
+                            .rounded(px(8.)),
+                    )
+                    .when_some(anim_badge, |d, label| {
+                        d.child(
                             div()
-                                .min_w_0()
-                                .truncate()
-                                .child(m.file_name.clone().unwrap_or_else(|| "ไฟล์".into())),
+                                .absolute()
+                                .top(px(6.))
+                                .left(px(6.))
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(p.overlay.opacity(0.75))
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(p.surface)
+                                .child(label),
                         )
-                        .when_some(m.file_size, |d, s| {
-                            d.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(12.))
-                                    .text_color(meta)
-                                    .child(format::file_size(s)),
-                            )
-                        }),
-                );
-            }
-            _ => {}
+                    })
+                    .into_any_element(),
+                None => div()
+                    .w(px(220.))
+                    .h(px(140.))
+                    .rounded(px(8.))
+                    .bg(if own {
+                        fg.opacity(0.1)
+                    } else {
+                        p.surface_muted
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(IconName::Image, 24., meta))
+                    .into_any_element(),
+            });
+        } else if m.message_type == MessageType::File {
+            bubble = bubble.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .p(px(8.))
+                    .rounded(px(8.))
+                    .bg(if own {
+                        fg.opacity(0.08)
+                    } else {
+                        p.surface_muted
+                    })
+                    .child(icon(IconName::File, 16., fg))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(m.file_name.clone().unwrap_or_else(|| "ไฟล์".into())),
+                    )
+                    .when_some(m.file_size, |d, s| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(meta)
+                                .child(format::file_size(s)),
+                        )
+                    }),
+            );
         }
         if unsent {
             bubble = bubble.child(div().text_color(meta).child("ยกเลิกข้อความแล้ว"));
@@ -1519,34 +1597,48 @@ impl Render for RoomView {
                                 .opacity(if p.dark { 0.03 } else { 0.05 }),
                         )
                     })
-                    .child(messages)
+                    .child(div().size_full().child(messages).with_animation(
+                        ElementId::Name(format!("room-enter-{}", self.room_epoch).into()),
+                        Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                        |d, delta| d.opacity(0.35 + 0.65 * delta),
+                    ))
                     .when(far, |d| {
                         d.child(
-                            div().absolute().right(px(28.)).bottom(px(12.)).child(
-                                div()
-                                    .id("to-bottom")
-                                    .size(px(36.))
-                                    .rounded_full()
-                                    .bg(p.surface)
-                                    .border_1()
-                                    .border_color(p.divider)
-                                    .shadow(vec![BoxShadow {
-                                        color: p.shadow,
-                                        offset: point(px(0.), px(2.)),
-                                        blur_radius: px(6.),
-                                        spread_radius: px(0.),
-                                        inset: false,
-                                    }])
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(hover_bg))
-                                    .child(icon(IconName::ArrowDown, ICON, p.ink_secondary))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.scroll_to_bottom(window, cx)
-                                    })),
-                            ),
+                            div()
+                                .absolute()
+                                .right(px(28.))
+                                .bottom(px(12.))
+                                .child(
+                                    div()
+                                        .id("to-bottom")
+                                        .size(px(36.))
+                                        .rounded_full()
+                                        .bg(p.surface)
+                                        .border_1()
+                                        .border_color(p.divider)
+                                        .shadow(vec![BoxShadow {
+                                            color: p.shadow,
+                                            offset: point(px(0.), px(2.)),
+                                            blur_radius: px(6.),
+                                            spread_radius: px(0.),
+                                            inset: false,
+                                        }])
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(hover_bg))
+                                        .child(icon(IconName::ArrowDown, ICON, p.ink_secondary))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.scroll_to_bottom(window, cx)
+                                        })),
+                                )
+                                .with_animation(
+                                    "to-bottom-enter",
+                                    Animation::new(Duration::from_millis(150))
+                                        .with_easing(ease_out_quint()),
+                                    |d, delta| d.opacity(delta),
+                                ),
                         )
                     }),
             )

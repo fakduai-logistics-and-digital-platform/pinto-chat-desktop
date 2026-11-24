@@ -311,6 +311,50 @@ impl Render for SettingsView {
                                         &p,
                                     )),
                             )
+                            .child(Self::section("พื้นที่จัดเก็บข้อมูลบนเครื่อง", &p).child({
+                                let stats = crate::cache::inspect(&crate::env::data_dir());
+                                let db_size = crate::cache::format_bytes(stats.db_bytes);
+                                let log_size = crate::cache::format_bytes(stats.log_bytes);
+                                Self::row(
+                                    "ฐานข้อมูลและไฟล์ Log",
+                                    Some("ฐานข้อมูลแชทออฟไลน์และบันทึกการทำงานบนเครื่อง"),
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(p.ink_secondary)
+                                                .font_features(tnum())
+                                                .child(format!("DB {db_size} · Log {log_size}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("clear-logs")
+                                                .h(px(28.))
+                                                .px(px(12.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(8.))
+                                                .border_1()
+                                                .border_color(p.hairline)
+                                                .bg(p.surface_muted)
+                                                .cursor_pointer()
+                                                .text_size(px(12.))
+                                                .text_color(p.ink)
+                                                .hover(|s| s.bg(p.divider))
+                                                .child("ล้าง Log เก่า")
+                                                .on_click(cx.listener(|_, _, _, cx| {
+                                                    crate::cache::clear_old_logs(
+                                                        &crate::env::data_dir(),
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                    &p,
+                                )
+                            }))
                             .child(
                                 div()
                                     .flex()

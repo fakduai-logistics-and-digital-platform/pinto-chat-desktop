@@ -89,6 +89,28 @@ impl Settings {
     }
 }
 
+/// Last known window geometry, restored on launch (adapted from Telegram Desktop).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl WindowState {
+    pub fn load() -> Option<Self> {
+        let s: Option<Self> = std::fs::read_to_string(data_dir().join("window.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        s.filter(|w| w.width >= 460.0 && w.height >= 480.0 && w.x.is_finite() && w.y.is_finite())
+    }
+
+    pub fn save(&self) {
+        write("window.json", self);
+    }
+}
+
 /// Stable per-install device id, sent as `X-Device-ID` so the server binds
 /// refresh tokens to this machine and can list it under logged-in devices.
 pub fn device_id() -> String {

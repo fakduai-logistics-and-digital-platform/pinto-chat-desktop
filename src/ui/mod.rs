@@ -9,13 +9,15 @@ mod widgets;
 
 use std::time::Duration;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{WindowExt, notification::Notification};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::{
     store::{Phase, Store, StoreEvent},
-    theme::{self, PaletteExt},
+    theme::{self, Palette, PaletteExt},
+    ui::widgets::icon,
 };
 use login::LoginView;
 use settings::{SettingsEvent, SettingsView};
@@ -49,6 +51,21 @@ impl PintoApp {
         .detach();
         cx.observe_window_appearance(window, |this, window, cx| this.sync_theme(window, cx))
             .detach();
+        if !(cfg!(debug_assertions) && std::env::var("PINTO_PREVIEW").is_ok()) {
+            cx.observe_window_bounds(window, |_, window, _| {
+                let b = window.bounds();
+                let state = crate::persist::WindowState {
+                    x: f32::from(b.origin.x),
+                    y: f32::from(b.origin.y),
+                    width: f32::from(b.size.width),
+                    height: f32::from(b.size.height),
+                };
+                if state.width >= 460.0 && state.height >= 480.0 {
+                    state.save();
+                }
+            })
+            .detach();
+        }
 
         // Opening the window syncs gpui-component's theme to the system, which
         // drops our overrides; install the palette again now the window exists.
@@ -175,7 +192,7 @@ impl PintoApp {
 }
 
 impl Render for PintoApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = cx.palette();
         let body = match &self.screen {
             Screen::Restoring => div()
@@ -199,6 +216,9 @@ impl Render for PintoApp {
             .font_family(theme::FONT_FAMILY)
             .text_size(px(14.))
             .child(body)
+            .when(cfg!(target_os = "windows"), |d| {
+                d.child(windows_caption_buttons(window, &p))
+            })
             .when_some(self.toast.clone(), |d, text| {
                 d.child(
                     div()
@@ -218,8 +238,73 @@ impl Render for PintoApp {
                                 .text_size(px(14.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(text),
+                        )
+                        .with_animation(
+                            ElementId::Name(format!("toast-{}", self.toast_epoch).into()),
+                            Animation::new(Duration::from_millis(160))
+                                .with_easing(ease_out_quint()),
+                            |d, delta| d.opacity(delta).mb(px(8. * delta)),
                         ),
                 )
             })
     }
+}
+
+/// Windows caption controls (Minimize, Maximize/Restore, Close) in the top-right corner.
+fn windows_caption_buttons(window: &Window, p: &Palette) -> impl IntoElement {
+    let hover_bg = p.surface_muted;
+    let max_icon = if window.is_maximized() {
+        IconName::Copy
+    } else {
+        IconName::Square
+    };
+
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .id("win-min")
+                .w(px(36.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .window_control_area(WindowControlArea::Min)
+                .hover(move |s| s.bg(hover_bg))
+                .child(icon(IconName::Minus, 14., p.ink_secondary))
+                .on_click(|_, window, _| window.minimize_window()),
+        )
+        .child(
+            div()
+                .id("win-max")
+                .w(px(36.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .window_control_area(WindowControlArea::Max)
+                .hover(move |s| s.bg(hover_bg))
+                .child(icon(max_icon, 12., p.ink_secondary))
+                .on_click(|_, window, _| window.zoom_window()),
+        )
+        .child(
+            div()
+                .id("win-close")
+                .w(px(36.))
+                .h(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .window_control_area(WindowControlArea::Close)
+                .hover(|s| s.bg(rgb(0xE81123)).text_color(white()))
+                .child(icon(IconName::X, 14., p.ink_secondary))
+                .on_click(|_, _, cx| cx.quit()),
+        )
 }
